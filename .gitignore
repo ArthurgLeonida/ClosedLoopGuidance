@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# Run outputs and data are not committed.
+results/
+bench/pie_bench/
+*.pt
+*.ckpt
+*.png
+*.jpg
+docs/

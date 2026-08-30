@@ -1,0 +1,12 @@
+# Pinned loosely; tighten once a working environment is confirmed on the server.
+torch
+torchvision
+diffusers
+transformers
+accelerate
+jaxtyping
+numpy
+Pillow
+pytest
+pandas
+matplotlib
