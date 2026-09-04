@@ -1,7 +1,7 @@
 """CFG vs SMC-CFG vs the surviving refinements, on the analytic plant.
 
-Runs on a laptop CPU in a few minutes. Everything the CFG-Ctrl paper argues
-about is *measured* here on a plant with ground truth:
+Runs on a laptop CPU. Diagnostics are measured on a plant with ground truth;
+they do not by themselves establish the paper's continuous-time assumptions:
 
   E1  pareto     fidelity (Frechet) and alignment (mean p(class|x)) vs the
                  guidance scale w, per method, with seed error bars. The
@@ -14,11 +14,11 @@ about is *measured* here on a plant with ground truth:
                  Includes the paper's law with measured-error memory, to
                  isolate the effect of storing the corrected error.
   E3  k_sweep    the chattering regime: sign vs boundary layer as k grows.
-  E4  loop_gain  finite-difference Jacobian of e along real trajectories: is
-                 Gamma ~ w*I as Theorem 1 assumes? what is the actual per-step
-                 authority dt*w*|J| compared with k?
-  E5  transfer   the same absolute k on a plant with twice the velocity scale,
-                 vs a relative (rms-normalised) k.
+  E4  loop_gain  next-error and next-surface sensitivities, including sampler
+                 step size and corrected-error memory; actual energy change
+                 and a counterfactual with the current correction omitted.
+  E5  transfer   double the target means/stds (with unit noise unchanged),
+                 compare absolute/relative k within each switching family.
 
 Outputs: results/toy/*.csv, *.png and summary.json (the numbers quoted in
 docs/CFG-Ctrl_Review_and_Improvements.md).
@@ -34,6 +34,7 @@ import argparse
 import csv
 import json
 import math
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -51,6 +52,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from cfgctrl import GaussianMixtureFlow, SMCConfig, SlidingModeGuidance, ring_mixture  # noqa: E402
 
 LAM = 6.0
+SCHEMA_VERSION = 2
 
 # Fixed colour slot per method, kept across every figure. Markers are the
 # secondary encoding so the figures survive greyscale printing.
@@ -100,8 +102,51 @@ def write_csv(path: Path, rows: List[Dict]) -> None:
         wri.writerows(rows)
 
 
+def write_summary(path: Path, summary: Dict) -> None:
+    """Merge partial runs with per-experiment provenance and strict JSON.
+
+    The top-level config describes the latest invocation. Older experiment
+    sections retain their own config, including a legacy version marker when
+    importing an old summary. Undefined interpolation ratios serialize as null.
+    """
+    current = dict(summary)
+    config = dict(current["config"], schema_version=SCHEMA_VERSION)
+    provenance = {key: dict(config) for key in current
+                  if len(key) > 1 and key[0] == "e" and key[1].isdigit()}
+    merged = {}
+    if path.exists():
+        with path.open(encoding="utf-8") as fh:
+            merged = json.load(fh)
+        previous = dict(merged.get("experiment_configs", {}))
+        for key in merged:
+            if len(key) > 1 and key[0] == "e" and key[1].isdigit():
+                previous.setdefault(key, dict(merged.get("config", {}),
+                                              schema_version=merged.get("schema_version", 1)))
+        previous.update(provenance)
+        provenance = previous
+    merged.update(current)
+    merged["schema_version"] = SCHEMA_VERSION
+    merged["config_scope"] = "latest invocation; see experiment_configs for each result section"
+    merged["experiment_configs"] = provenance
+
+    def json_safe(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, dict):
+            return {key: json_safe(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [json_safe(item) for item in value]
+        return value
+
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as fh:
+        json.dump(json_safe(merged), fh, indent=1, allow_nan=False)
+        fh.write("\n")
+    temporary.replace(path)
+
+
 def mean_std(vals: Sequence[float]) -> Tuple[float, float]:
-    vals = [v for v in vals if v == v]
+    vals = [v for v in vals if math.isfinite(v)]
     if not vals:
         return float("nan"), float("nan")
     m = sum(vals) / len(vals)
@@ -115,10 +160,9 @@ def agg(rows: List[Dict], key: str, **where) -> Tuple[float, float]:
 def pareto_ratio(rows: List[Dict], method: str, ws: Sequence[float]) -> Dict[str, float]:
     """Frechet relative to the CFG curve at MATCHED alignment. Below 1 = better.
 
-    This is the only fair comparison: a law that just lowers the effective w
-    slides along the CFG curve and scores 1.0. Note the ratio is meaningless
-    where the curve is vertical (alignment saturated near 1), so read it only
-    in the region where mean p(class|x) is still moving.
+    This is a grid-dependent linear interpolation diagnostic, not a dominance
+    test or a confidence interval. Omit out-of-range, near-saturated and nearly
+    duplicate alignment intervals, where an interpolated ratio is unreliable.
     """
     pts = sorted((agg(rows, "confidence", method="CFG (P-control)", w=w)[0],
                   agg(rows, "frechet", method="CFG (P-control)", w=w)[0]) for w in ws)
@@ -126,9 +170,12 @@ def pareto_ratio(rows: List[Dict], method: str, ws: Sequence[float]) -> Dict[str
     for w in ws:
         c, f = agg(rows, "confidence", method=method, w=w)[0], agg(rows, "frechet", method=method, w=w)[0]
         base = None
+        if not math.isfinite(c) or not math.isfinite(f) or c >= 1 - 1e-3:
+            out[str(w)] = float("nan")
+            continue
         for (c0, f0), (c1, f1) in zip(pts, pts[1:]):
-            if c0 <= c <= c1:
-                base = f0 + (c - c0) / max(c1 - c0, 1e-12) * (f1 - f0)
+            if c0 <= c <= c1 and c1 - c0 > 1e-3:
+                base = f0 + (c - c0) / (c1 - c0) * (f1 - f0)
                 break
         out[str(w)] = f / base if base and base > 0 else float("nan")
     return out
@@ -230,8 +277,8 @@ def exp_signals(out: Path, plant: GaussianMixtureFlow, w: float, k: float, steps
                              **{kk: getattr(st, kk) for kk in keys}))
         summary.setdefault("e2", {})[name] = {
             "s_rms_first": trace.steps[0].s_rms, "s_rms_final": trace.steps[-1].s_rms,
-            "chatter_last10": sum(trace.series("chatter")[-10:]) / 10,
-            "switch_activity_last10": sum(trace.series("switch_activity")[-10:]) / 10,
+            "chatter_last10": statistics.mean(trace.series("chatter")[-10:]),
+            "switch_activity_last10": statistics.mean(trace.series("switch_activity")[-10:]),
             "deriv_matters_mean": r["deriv_matters_mean"],
             "frechet": r["frechet"], "confidence": r["confidence"],
         }
@@ -291,73 +338,95 @@ def exp_k_sweep(out: Path, plant: GaussianMixtureFlow, w: float, ks: Sequence[fl
 
 def exp_loop_gain(out: Path, plants: Dict[str, GaussianMixtureFlow], w: float, k: float,
                   steps: int, n: int, summary: Dict) -> None:
-    """Along a paper-SMC trajectory, measure J = de/dx.
+    """Discrete diagnostics along a paper-law trajectory, before terminal sigma.
 
-    The Euler step moves x by -dt*w*(e + delta), so the correction changes the
-    NEXT measured error by -dt*w*J*delta. Define M = -J: the paper's reaching
-    condition needs s^T M sign(s) > 0, and its Assumption 2 wants M ~ I to
-    within a 1/sqrt(D) relative deviation.
+    For h = sigma_next - sigma_now, the actual next error is evaluated at
+    x_next = x + h*(v_u + w*(e + delta)). Its input Jacobian is h*w*J_next.
+    Corrected-error memory adds (lam-1)*I to the NEXT surface's Jacobian.
+    Also compare actual next surface energy with the counterfactual delta=0,
+    holding the current x and previous memory fixed. Neither a Jacobian sign
+    nor a finite-step energy decrease certifies the paper's Assumption 2 or
+    continuous reaching condition. No gain is compared with k: their units
+    differ. The terminal update has no subsequent controller evaluation.
     """
+    if steps < 2:
+        raise ValueError("e4 needs at least two steps for a next controller evaluation")
     rows = []
     fig, axes = plt.subplots(1, len(plants), figsize=(5.2 * len(plants), 3.8), squeeze=False)
     for p_i, (tag, plant) in enumerate(plants.items()):
         D = plant.D
         ctrl = SlidingModeGuidance(SMCConfig(lam=LAM, k=k))
         g = torch.Generator().manual_seed(0)
-        x = torch.randn(n, D, generator=g)
+        # Start from the same float32 noise as sampling, then use double for
+        # finite differences so small late-time derivatives are not roundoff.
+        x = torch.randn(n, D, generator=g).to(torch.float64)
         sig = plant.sigma_schedule(steps)
         e_prev = None
         emin, emax, emean, sigmas = [], [], [], []
-        for i in range(steps):
-            s_now, s_next = float(sig[i]), float(sig[i + 1])
-            dt = s_now - s_next
+        for i in range(steps - 1):
+            s_now, sigma_next = float(sig[i]), float(sig[i + 1])
+            h = sigma_next - s_now
             v_u = plant.velocity(x, s_now, None)
             e = plant.velocity(x, s_now, 0) - v_u
-            J = plant.error_jacobian(x, s_now, 0)
-            M = -J
-            eig = torch.linalg.eigvalsh(0.5 * (M + M.transpose(1, 2)))          # [n, D]
             e_prev = e if e_prev is None else e_prev
             s = (e - e_prev) + LAM * e_prev
-            sg = torch.sign(s)
-            reach = torch.einsum("bi,bij,bj->b", s, M, sg)
-            dev = torch.linalg.matrix_norm(M - torch.eye(D)[None], ord=2)
-            gain = dt * w * torch.linalg.matrix_norm(J, ord=2)
+            e_app = ctrl.correct(e, w=w)
+            x_next = x + h * (v_u + w * e_app)
+            x_without_correction = x + h * (v_u + w * e)
+            s_next = plant.error(x_next, sigma_next, 0) + (LAM - 1) * e_app
+            s_without_correction = (plant.error(x_without_correction, sigma_next, 0)
+                                    + (LAM - 1) * e)
+            energy_change = 0.5 * (s_next.square().sum(1) - s.square().sum(1))
+            correction_energy_change = 0.5 * (
+                s_next.square().sum(1) - s_without_correction.square().sum(1))
+            J_next = plant.error_jacobian(x_next, sigma_next, 0, eps=1e-4)
+            error_sensitivity = h * w * J_next
+            surface_sensitivity = error_sensitivity + (LAM - 1) * torch.eye(D, dtype=x.dtype)[None]
+            eig = torch.linalg.eigvalsh(0.5 * (surface_sensitivity + surface_sensitivity.transpose(1, 2)))
+            gain = torch.linalg.matrix_norm(error_sensitivity, ord=2)
             rows.append(dict(plant=tag, step=i, sigma=s_now,
-                             eig_min=float(eig.min()), eig_mean=float(eig.mean()),
-                             eig_max=float(eig.max()),
-                             frac_reaching_ok_paper_sign=float((reach > 0).float().mean()),
-                             frac_assumption2=float((dev < 1 / math.sqrt(D)).float().mean()),
-                             loop_gain_median=float(gain.median()),
-                             loop_gain_max=float(gain.max()), k=k))
+                             sigma_next=sigma_next,
+                             surface_sensitivity_eig_min=float(eig.min()),
+                             surface_sensitivity_eig_mean=float(eig.mean()),
+                             surface_sensitivity_eig_max=float(eig.max()),
+                             frac_surface_energy_decreased=float((energy_change < 0).double().mean()),
+                             frac_correction_reduces_next_surface_energy=float(
+                                 (correction_energy_change < 0).double().mean()),
+                             surface_energy_change_mean=float(energy_change.mean()),
+                             correction_energy_change_mean=float(correction_energy_change.mean()),
+                             next_error_sensitivity_norm_median=float(gain.median()),
+                             next_error_sensitivity_norm_max=float(gain.max()), k=k))
             emin.append(float(eig.min())); emax.append(float(eig.max()))
             emean.append(float(eig.mean())); sigmas.append(s_now)
-            e_app = ctrl.correct(e)
             e_prev = e_app
-            x = x + (s_next - s_now) * (v_u + w * e_app)
+            x = x_next
 
         ax = axes[0][p_i]
         ax.fill_between(sigmas, emin, emax, color=COLORS[4], alpha=0.18, linewidth=0,
                         label="min..max over samples")
-        ax.plot(sigmas, emean, color=COLORS[4], linewidth=1.8, label="mean eigenvalue of sym(-de/dx)")
-        ax.plot(sigmas, [1.0] * len(sigmas), color=COLORS[0], linewidth=1.4, linestyle="--",
-                label="Assumption 2 wants ~ +1 (identity)")
+        ax.plot(sigmas, emean, color=COLORS[4], linewidth=1.8,
+                label="mean eigenvalue of symmetric next-surface sensitivity")
+        ax.axhline(LAM - 1, color=COLORS[0], linewidth=1.4, linestyle="--",
+                   label="corrected-memory contribution (lambda - 1)")
         ax.axhline(0.0, color=TEXT2, linewidth=0.8)
-        style(ax, f"One-step loop gain along trajectories ({tag}, D={D})", "sigma",
-              "eigenvalues of sym(-de/dx)")
+        style(ax, f"Discrete next-surface input sensitivity ({tag}, D={D})", "sigma",
+              "eigenvalues of sym(h*w*J_next + (lambda-1)*I)")
         ax.invert_xaxis()
         ax.set_yscale("symlog", linthresh=1.0)
         ax.legend(fontsize=6.5, frameon=False, labelcolor=TEXT2)
 
-        inner = [r for r in rows if r["plant"] == tag][1:]      # skip sigma=1 where J=0
+        inner = [r for r in rows if r["plant"] == tag]
         summary.setdefault("e4", {})[tag] = {
-            "frac_assumption2_mean": sum(r["frac_assumption2"] for r in inner) / len(inner),
-            "frac_reaching_ok_paper_sign_mean":
-                sum(r["frac_reaching_ok_paper_sign"] for r in inner) / len(inner),
-            "loop_gain_median_over_traj":
-                sorted(r["loop_gain_median"] for r in inner)[len(inner) // 2],
-            "loop_gain_max_over_traj": max(r["loop_gain_max"] for r in inner),
-            "eig_min_overall": min(r["eig_min"] for r in inner),
-            "eig_max_overall": max(r["eig_max"] for r in inner), "k": k,
+            "diagnostic": "discrete nonterminal transitions; not a theorem-assumption test",
+            "frac_surface_energy_decreased_mean":
+                statistics.mean(r["frac_surface_energy_decreased"] for r in inner),
+            "frac_correction_reduces_next_surface_energy_mean":
+                statistics.mean(r["frac_correction_reduces_next_surface_energy"] for r in inner),
+            "next_error_sensitivity_median_of_step_medians":
+                statistics.median(r["next_error_sensitivity_norm_median"] for r in inner),
+            "next_error_sensitivity_max": max(r["next_error_sensitivity_norm_max"] for r in inner),
+            "surface_sensitivity_eig_min": min(r["surface_sensitivity_eig_min"] for r in inner),
+            "surface_sensitivity_eig_max": max(r["surface_sensitivity_eig_max"] for r in inner), "k": k,
         }
     write_csv(out / "e4_loop_gain.csv", rows)
     savefig(fig, out / "e4_loop_gain.png")
@@ -366,10 +435,14 @@ def exp_loop_gain(out: Path, plants: Dict[str, GaussianMixtureFlow], w: float, k
 def exp_transfer(out: Path, w: float, k: float, steps: int, n: int,
                  seeds: Sequence[int], summary: Dict) -> None:
     plants = {"radius 4": ring_mixture(radius=4.0, std=1.5),
-              "radius 8 (2x scale)": ring_mixture(radius=8.0, std=3.0)}
+              "radius 8 (2x data scale)": ring_mixture(radius=8.0, std=3.0)}
     configs = [
         ("CFG (P-control)", SMCConfig(k=0.0)),
         ("SMC paper, absolute k", SMCConfig(lam=LAM, k=k)),
+        ("SMC sign, relative k (fraction of rms e)",
+         SMCConfig(lam=LAM, k=k, relative_gain=True)),
+        ("SMC sat, absolute k",
+         SMCConfig(lam=LAM, k=k, switching="sat", phi=k * LAM, store_corrected=False)),
         ("SMC sat, relative k (fraction of rms e)",
          SMCConfig(lam=LAM, k=k, relative_gain=True, switching="sat",
                    phi=k * LAM, store_corrected=False)),
@@ -396,16 +469,29 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--k", type=float, default=0.1, help="paper's k for SD3.5 / Qwen-Image")
     ap.add_argument("--steps", type=int, default=30, help="the paper uses 30 sampling steps")
-    ap.add_argument("--only", nargs="*", default=None, help="subset of e1..e5")
+    ap.add_argument("--threads", type=int, default=1, help="CPU threads (small toy tensors favor one)")
+    ap.add_argument("--only", nargs="+", choices=[f"e{i}" for i in range(1, 6)],
+                    default=None, help="subset of e1..e5")
     args = ap.parse_args()
+    want = set(args.only) if args.only else {f"e{i}" for i in range(1, 6)}
+    if not math.isfinite(args.k) or args.k < 0:
+        ap.error("--k must be finite and nonnegative")
+    if args.steps < 1 or ("e4" in want and args.steps < 2):
+        ap.error("--steps must be positive (at least 2 when running e4)")
+    if args.threads < 1:
+        ap.error("--threads must be positive")
+    torch.set_num_threads(args.threads)
     args.out.mkdir(parents=True, exist_ok=True)
 
     n = 1000 if args.quick else 3000
     seeds = [0, 1] if args.quick else [0, 1, 2]
     ws = [1.0, 1.25, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0]
-    want = set(args.only) if args.only else {f"e{i}" for i in range(1, 6)}
     summary: Dict = {"config": dict(n=n, seeds=seeds, ws=ws, k=args.k,
-                                    steps=args.steps, lam=LAM)}
+                                    steps=args.steps, lam=LAM, threads=args.threads,
+                                    torch_version=torch.__version__, python_version=sys.version,
+                                    metric="Gaussian moment W2 (square root of FID expression)",
+                                    loop_gain_n=64 if args.quick else 256,
+                                    diagnostic_seed=0, reference_seed=77)}
     t0 = time.time()
 
     # Classes overlap (Bayes accuracy ~ 0.7) so guidance has a job and the
@@ -429,7 +515,7 @@ def main() -> None:
         exp_k_sweep(args.out, ring2, 5.0, [0.02, 0.05, 0.1, 0.2, 0.5, 1.0],
                     args.steps, n, seeds, summary)
     if "e4" in want:
-        log("E4 loop gain / Assumption 2")
+        log("E4 discrete next-error / next-surface diagnostics")
         exp_loop_gain(args.out, {"ring2d": ring2, "ring8d": ring_mixture(k=8, radius=4.0, std=1.5, dim=8)},
                       5.0, args.k, args.steps, 64 if args.quick else 256, summary)
     if "e5" in want:
@@ -437,13 +523,7 @@ def main() -> None:
         exp_transfer(args.out, 5.0, args.k, args.steps, n, seeds, summary)
 
     path = args.out / "summary.json"
-    if path.exists():                      # merge, so `--only eN` does not erase the rest
-        with open(path) as fh:
-            old = json.load(fh)
-        old.update(summary)
-        summary = old
-    with open(path, "w") as fh:
-        json.dump(summary, fh, indent=1, default=float)
+    write_summary(path, summary)
     log(f"done; wrote {args.out}/")
 
 

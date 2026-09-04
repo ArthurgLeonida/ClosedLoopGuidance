@@ -8,3 +8,5 @@ pytest
 diffusers
 transformers
 accelerate
+sentencepiece
+protobuf

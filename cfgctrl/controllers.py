@@ -29,16 +29,16 @@ THE PAPER'S LAW (Algorithm 1; authors' pipeline/common_cfg_ctrl.py):
 Tuned values (supplementary Sec. 7.3): lam = 6 for all three models;
 k = 0.1 for SD3.5 and Qwen-Image, k = 0.7 for Flux-dev.
 
-THE THREE REFINEMENTS THAT SURVIVED MEASUREMENT. Each is one flag; with all of
-them off you get the paper. The evidence is in
-docs/CFG-Ctrl_Review_and_Improvements.md; variants that were measured and did
-not help (time-scaled surface, super-twisting, adaptive gain, unit-vector
-switching, flipped switching direction) were removed and live in git history.
+REFINEMENTS TO TEST AGAINST THE PAPER. Each is one flag; the defaults reproduce
+the paper implementation. See docs/Improvement_Roadmap.md for the rationale,
+limitations, and a real-model evaluation plan. Toy findings do not establish
+an image-quality improvement.
 
     switching       'sign' (paper) or 'sat': a boundary layer of half-width
                     phi (Slotine & Li, Applied Nonlinear Control, ch. 7).
-                    Removes chattering. With phi = k*lam the law becomes exact
-                    soft-thresholding of e by k. Measured: rms(s) reaches 0.010
+                    Smooths switching. With phi = k*lam and s = lam*e (the first
+                    step, or constant measured-error memory), the law is exact
+                    soft-thresholding of e by k. Historical toy: rms(s) reaches 0.010
                     instead of plateauing at 0.50, and the switching activity
                     is 0.03 of full chatter at every k against the sign law's
                     0.39 (k=0.02) to 0.83 (k=1).
@@ -50,7 +50,8 @@ switching, flipped switching direction) were removed and live in git history.
                     makes s ~ (lam - 1) * delta_prev: for lam > 1 the sign
                     alternates every step (chatter of amplitude k), for lam < 1
                     it locks a constant bias of size k for the rest of the run.
-                    The authors' README default lam = 0.05 is in that regime.
+                    These are small-error limits, not guarantees for a changing
+                    model prediction.
 
     excess_only     shrink only the extrapolation (w - 1) * e, never the
                     conditional prediction itself:
@@ -64,14 +65,16 @@ switching, flipped switching direction) were removed and live in git history.
                     `correct`.
 
     relative_gain   k is a fraction of rms(e_t) rather than an absolute
-                    velocity unit, so one k transfers across models whose
-                    velocity scales differ (the paper needs k = 0.1 for SD3.5
-                    and Qwen-Image but k = 0.7 for Flux).
+                    velocity unit. With saturation, phi is also multiplied by
+                    rms(e_t); this makes the law equivariant to a constant positive
+                    rescaling of an error sequence. Cross-model transfer still
+                    needs experiments.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from typing import List, Literal, Optional, Union
 
 import torch
@@ -90,13 +93,13 @@ class SMCConfig:
     excess_only: bool = False
 
     def validate(self) -> None:
-        if self.lam < 0:
-            raise ValueError("lam must be >= 0")
-        if self.k < 0:
-            raise ValueError("k must be >= 0")
+        for name in ("lam", "k", "phi"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0")
         if self.switching not in ("sign", "sat"):
             raise ValueError(f"unknown switching function {self.switching!r}")
-        if self.switching == "sat" and self.phi <= 0:
+        if self.switching == "sat" and self.k > 0 and self.phi <= 0:
             raise ValueError("'sat' switching needs a boundary layer phi > 0")
 
     @property
@@ -120,6 +123,12 @@ class StepInfo:
 
 def rms(x: torch.Tensor) -> torch.Tensor:
     """Root mean square over every dim but the batch, keepdim so it broadcasts."""
+    if x.ndim < 1 or x.numel() == 0:
+        raise ValueError("x must have a nonempty batch dimension and samples")
+    if x.dtype in (torch.float16, torch.bfloat16):
+        x = x.float()
+    if x.ndim == 1:
+        return x.abs()  # Each batch entry is one scalar, not a shared norm.
     dims = tuple(range(1, x.dim()))
     return x.pow(2).mean(dim=dims, keepdim=True).sqrt()
 
@@ -137,7 +146,7 @@ class SlidingModeGuidance:
         if overrides:
             cfg = replace(cfg, **overrides)
         cfg.validate()
-        self.cfg = cfg
+        self.cfg = replace(cfg)
         self.history: List[StepInfo] = []
         self.reset()
 
@@ -166,37 +175,63 @@ class SlidingModeGuidance:
                Required when `excess_only` is on; ignored otherwise.
         """
         cfg = self.cfg
-        if e.dim() < 1:
-            raise ValueError("e must have a batch dimension")
+        if e.dim() < 1 or e.numel() == 0:
+            raise ValueError("e must have a nonempty batch dimension and samples")
+        if not e.is_floating_point():
+            raise ValueError("e must be a real floating-point tensor")
+        if w is not None and not math.isfinite(w):
+            raise ValueError("w must be finite")
         if cfg.excess_only and (w is None or w < 1.0):
             raise ValueError("excess_only needs the guidance scale w >= 1")
 
+        # Accumulate half-precision surfaces and norms in float32. Keep the
+        # original float32/float64 arithmetic for the paper reference tests.
         e_meas = e.detach()
+        if e_meas.dtype in (torch.float16, torch.bfloat16):
+            e_meas = e_meas.float()
+        if self._e_prev is not None and (
+            self._e_prev.shape != e_meas.shape
+            or self._e_prev.device != e_meas.device
+            or self._e_prev.dtype != e_meas.dtype
+        ):
+            raise ValueError("error shape, device or precision changed; call reset() first")
         if self._e_prev is None:
             self._e_prev = e_meas.clone()              # paper: s_0 = lam * e_0
 
         # ---- sliding variable  s = (e - e_prev) + lam * e_prev
         s = (e_meas - self._e_prev) + cfg.lam * self._e_prev
 
-        # ---- switching function sw(s) in [-1, 1]
-        if cfg.switching == "sign":
-            sw = torch.sign(s)
-        else:
-            sw = torch.clamp(s / cfg.phi, -1.0, 1.0)
-
         # ---- gain and correction
         k_eff: Union[float, torch.Tensor] = cfg.k
+        phi_eff: Union[float, torch.Tensor] = cfg.phi
         if cfg.relative_gain:
-            k_eff = k_eff * rms(e_meas)
-        delta = -k_eff * sw
-        if cfg.excess_only:
-            delta = delta * ((w - 1.0) / w)            # shrink only the extrapolation
+            scale = rms(e_meas)
+            k_eff = k_eff * scale
+            phi_eff = phi_eff * scale
 
-        e_app = e + delta                              # keeps e's autograd graph if any
+        # Exact no-op branches also avoid 0 * inf and permit phi=0 at k=0.
+        inactive = cfg.is_cfg or (cfg.excess_only and w == 1.0)
+        if inactive:
+            delta = torch.zeros_like(e_meas)
+        else:
+            if cfg.switching == "sign":
+                sw = torch.sign(s)
+            else:
+                # A zero relative scale implies k_eff=0. A harmless denominator
+                # keeps that sample finite even when its memory is nonzero.
+                if torch.is_tensor(phi_eff):
+                    phi_eff = torch.where(phi_eff > 0, phi_eff, torch.ones_like(phi_eff))
+                sw = torch.clamp(s / phi_eff, -1.0, 1.0)
+            delta = -k_eff * sw
+            if cfg.excess_only:
+                delta = delta * ((w - 1.0) / w)        # shrink only the extrapolation
+
+        # Preserve the caller's dtype and the identity gradient through e.
+        e_app = e if inactive else (e.to(e_meas.dtype) + delta).to(e.dtype)
 
         # ---- diagnostics
         sgn = torch.sign(s)
-        delta_d = delta.detach()
+        delta_d = e_app.detach().to(e_meas.dtype) - e_meas
         self.history.append(StepInfo(
             step=self._step,
             e_rms=float(rms(e_meas).mean()),
@@ -213,7 +248,7 @@ class SlidingModeGuidance:
         # ---- state
         self._sign_prev = sgn
         self._delta_prev = delta_d.clone()
-        self._e_prev = (e_app.detach() if cfg.store_corrected else e_meas).clone()
+        self._e_prev = (e_app.detach().to(e_meas.dtype) if cfg.store_corrected else e_meas).clone()
         self._step += 1
         return e_app
 
@@ -232,14 +267,15 @@ def paper(lam: float = 6.0, k: float = 0.1) -> SMCConfig:
 def boundary_layer(lam: float = 6.0, k: float = 0.1,
                    phi: Optional[float] = None) -> SMCConfig:
     """sat(s/phi) instead of sign(s), storing the measured error. The default
-    phi = k*lam makes the law exact soft-thresholding of e by k."""
+    phi = k*lam gives soft-thresholding at the first step or for constant e.
+    At later steps the previous measurement also affects the correction."""
     return SMCConfig(lam=lam, k=k, switching="sat", store_corrected=False,
                      phi=(k * lam if phi is None else phi))
 
 
 def boundary_layer_excess(lam: float = 6.0, k: float = 0.1,
                           phi: Optional[float] = None) -> SMCConfig:
-    """The recommended law: boundary layer applied to the extrapolation only.
+    """Candidate law: boundary layer applied to the extrapolation only.
     Exactly CFG at w = 1. Pass w to correct()."""
     return SMCConfig(lam=lam, k=k, switching="sat", store_corrected=False,
                      excess_only=True, phi=(k * lam if phi is None else phi))

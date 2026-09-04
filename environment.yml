@@ -1,15 +1,10 @@
 # conda env create -f environment.yml && conda activate clg
 #
-# Conda supplies the interpreter; pip supplies the packages. PyTorch deprecated
-# its own conda channel in 2024, so `conda install pytorch` no longer gets you a
-# current build -- installing torch from pip inside a conda env is the
-# maintained path, and mixing the two in one env is the usual source of
-# "two torches" breakage.
+# Conda supplies the interpreter; pip supplies the packages.
 #
-# The --extra-index-url line makes pip prefer the CUDA 12.4 torch wheel while
-# still resolving everything else from PyPI. Change cu124 -> cu126 / cu128 if
-# you need a different CUDA build (cu128 for Blackwell); drop the line entirely
-# for a CPU-only machine.
+# This portable spec does not select a CUDA build. For GPU work, use the
+# official PyTorch installation selector and verify the build as in VLAB.md.
+# An extra pip index has no priority over PyPI and would not pin CUDA 12.4.
 name: clg
 
 channels:
@@ -19,7 +14,6 @@ dependencies:
   - python=3.11
   - pip
   - pip:
-      - --extra-index-url https://download.pytorch.org/whl/cu124
       - torch
 
       # the toy experiments and the test suite
