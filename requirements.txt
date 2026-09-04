@@ -1,12 +1,10 @@
-# Pinned loosely; tighten once a working environment is confirmed on the server.
+# cfgctrl/ itself needs only torch. The rest is for the experiments and for
+# driving a real diffusers pipeline through cfgctrl/diffusers_hook.py.
 torch
-torchvision
+matplotlib
+pytest
+
+# only needed to run against a real model (SD3.5, Flux, ...)
 diffusers
 transformers
 accelerate
-jaxtyping
-numpy
-Pillow
-pytest
-pandas
-matplotlib

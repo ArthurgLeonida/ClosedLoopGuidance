@@ -1,18 +1,20 @@
 """Pure-logic tests for the CFG-Ctrl reimplementation. CPU only, a few seconds.
 
-    python -m pytest tests/test_smc_cfg.py -v
+    python -m pytest tests/ -q
 
-The important ones, in order:
-  * test_k_zero_is_exact_cfg_for_every_variant  -- baseline is a special case
+The ones that carry the most weight, in order:
+  * test_k_zero_is_exact_cfg_for_every_variant  -- the baseline is a special
+    case of the method, so any measured difference is due to the correction
   * test_reference_implementation_of_paper_law  -- we implement what the
     authors' code does, not what we think Algorithm 1 says
-  * the toy-plant tests -- the analytic velocity field really transports
+  * test_corrected_memory_alternates_once_the_error_is_small -- the chattering
+    mechanism, reproduced from first principles
+  * the toy-plant tests -- the analytic velocity field really does transport
     N(0, I) to the mixture, otherwise every experiment number is noise
 """
 
 from dataclasses import dataclass
 
-import math
 import pytest
 import torch
 
@@ -23,41 +25,37 @@ torch.manual_seed(0)
 
 
 def _seq(n=8, shape=(4, 3, 5, 5), seed=0):
+    """A decaying, slightly noisy error sequence, like a real denoising run."""
     g = torch.Generator().manual_seed(seed)
     e0 = torch.randn(shape, generator=g)
     return [e0 * (0.9 ** i) + 0.05 * torch.randn(shape, generator=g) for i in range(n)]
 
 
 # --------------------------------------------------------------------------
-# Baseline is a special case
+# The baseline is a special case of the method
 # --------------------------------------------------------------------------
 
 def test_k_zero_is_exact_cfg_for_every_variant():
-    variants = [
-        dict(),
-        dict(switching="sat", phi=0.5),
-        dict(switching="tanh", phi=0.5),
-        dict(direction="unit"),
-        dict(time_scaled=True),
-        dict(store_corrected=False),
-        dict(relative_gain=True),
-    ]
-    for kw in variants:
+    for kw in [dict(),
+               dict(switching="sat", phi=0.5),
+               dict(store_corrected=False),
+               dict(relative_gain=True),
+               dict(excess_only=True)]:
         c = SlidingModeGuidance(SMCConfig(k=0.0, **kw))
         assert c.is_cfg
         for e in _seq():
-            assert torch.equal(c.correct(e, dt=1 / 30), e), kw
+            assert torch.equal(c.correct(e, w=3.0), e), kw
 
 
 # --------------------------------------------------------------------------
-# Faithfulness to the paper / authors' code
+# Faithfulness to the paper / the authors' code
 # --------------------------------------------------------------------------
 
 def test_reference_implementation_of_paper_law():
     """Replay the authors' pipeline/common_cfg_ctrl.py literally:
-        s   = (e - prev) + lam * prev
-        u   = -K * sign(s)
-        e   = e + u
+        s    = (e - prev) + lam * prev
+        u    = -k * sign(s)
+        e    = e + u
         prev = e            # the CORRECTED error is stored
     """
     lam, k = 6.0, 0.1
@@ -74,11 +72,43 @@ def test_reference_implementation_of_paper_law():
 
 
 def test_first_step_is_a_sign_shrink_of_e():
-    """At the first step prev := e so s = lam*e and delta = -k*sign(e)."""
+    """At the first step prev := e, so s = lam*e and delta = -k*sign(e)."""
     k = 0.1
     c = SlidingModeGuidance(presets.paper(6.0, k))
     e = torch.randn(2, 16)
     assert torch.allclose(c.correct(e), e - k * torch.sign(e))
+
+
+def test_large_lambda_makes_surface_sign_equal_to_error_sign():
+    """With lam = 6 and a slowly varying e, sign(s) == sign(e_prev) for every
+    element: the derivative term never decides, so the paper's law reduces to
+    the memoryless sign-shrink e - k*sign(e)."""
+    c = SlidingModeGuidance(presets.paper(6.0, 0.01))
+    e = torch.randn(3, 64) + 0.5
+    for _ in range(10):
+        c.correct(e)
+        e = 0.97 * e
+    assert all(h.deriv_matters == 0.0 for h in c.history)
+
+
+def test_corrected_memory_alternates_once_the_error_is_small():
+    """The chattering mechanism. Storing the CORRECTED error puts the previous
+    correction back into the surface with weight (lam - 1). Once |e| < k the
+    sign of s is set by that term alone, so the correction flips every step and
+    rms(s) never reaches zero. Storing the MEASURED error removes it."""
+    lam, k = 6.0, 0.1
+    e = torch.full((1, 8), 0.02)                      # |e| < k
+
+    c_paper = SlidingModeGuidance(SMCConfig(lam=lam, k=k, store_corrected=True))
+    deltas = [float((c_paper.correct(e) - e).flatten()[0]) for _ in range(8)]
+    assert all(a * b < 0 for a, b in zip(deltas, deltas[1:])), deltas
+    assert all(h.chatter == 1.0 for h in c_paper.history[1:])
+    assert c_paper.history[-1].s_rms == pytest.approx((lam - 1) * k, rel=0.3)
+
+    c_fixed = SlidingModeGuidance(SMCConfig(lam=lam, k=k, store_corrected=False))
+    deltas = [float((c_fixed.correct(e) - e).flatten()[0]) for _ in range(8)]
+    assert all(d == pytest.approx(-k) for d in deltas)
+    assert all(h.chatter == 0.0 for h in c_fixed.history)
 
 
 def test_store_corrected_false_uses_measured_error():
@@ -90,26 +120,16 @@ def test_store_corrected_false_uses_measured_error():
     assert torch.allclose(c.correct(e2), e2 - k * torch.sign(s2))
 
 
-def test_large_lambda_makes_surface_sign_equal_to_error_sign():
-    """With lam = 6 and a slowly varying e, sign(s) == sign(e_prev) for every
-    element: the derivative term never decides. The paper's law then reduces
-    to e - k*sign(e)."""
-    c = SlidingModeGuidance(presets.paper(6.0, 0.01))
-    e = torch.randn(3, 64) + 0.5
-    for _ in range(10):
-        c.correct(e)
-        e = 0.97 * e
-    assert all(h.deriv_matters == 0.0 for h in c.history)
-
-
 # --------------------------------------------------------------------------
-# Refinements
+# The refinements
 # --------------------------------------------------------------------------
 
 def test_boundary_layer_phi_k_lam_is_exact_soft_threshold_at_first_step():
+    """phi = k*lam turns the law into the L1 proximal operator: small elements
+    are zeroed rather than sign-flipped, large ones shrink by k."""
     lam, k = 6.0, 0.1
-    c = SlidingModeGuidance(presets.boundary_layer(lam, k))          # phi = k*lam
-    e = torch.randn(4, 32) * 0.3                                     # many |e| < k
+    c = SlidingModeGuidance(presets.boundary_layer(lam, k))
+    e = torch.randn(4, 32) * 0.3                                # many |e| < k
     assert torch.allclose(c.correct(e), soft_threshold(e, k), atol=1e-6)
 
 
@@ -119,117 +139,13 @@ def test_sat_equals_sign_outside_layer_and_is_continuous_inside():
     c_sign = SlidingModeGuidance(presets.paper(lam, k))
     c_sat = SlidingModeGuidance(SMCConfig(lam=lam, k=k, switching="sat", phi=phi))
     assert torch.allclose(c_sign.correct(big), c_sat.correct(big))
-    # inside the layer the map e -> e_app is Lipschitz with constant 1 + k*lam/phi
-    c_sat.reset()
+    # inside the layer, e -> e_app is Lipschitz with constant 1 + k*lam/phi
     e_a = torch.tensor([[0.01, -0.02]])
-    e_b = e_a + 1e-3
+    c_sat.reset()
     out_a = c_sat.correct(e_a)
     c_sat.reset()
-    out_b = c_sat.correct(e_b)
+    out_b = c_sat.correct(e_a + 1e-3)
     assert (out_b - out_a).abs().max() <= (1 + k * lam / phi) * 1e-3 + 1e-7
-
-
-def test_unit_direction_correction_has_norm_k_per_sample():
-    k = 0.3
-    c = SlidingModeGuidance(SMCConfig(lam=6.0, k=k, direction="unit"))
-    e = torch.randn(5, 3, 7, 7)
-    delta = c.correct(e) - e
-    norms = delta.flatten(1).norm(dim=1)
-    assert torch.allclose(norms, torch.full_like(norms, k), atol=1e-5)
-
-
-def test_time_scaled_surface_converges_with_step_refinement():
-    """e(t) = e0 exp(-a t), t: 0 -> 1. The true surface is s = (lam - a) e.
-    The time-scaled discrete surface converges to it as steps grow; the
-    paper's unscaled difference does not (its derivative term shrinks 1/N)."""
-    a, lam = 3.0, 6.0
-    e0 = torch.ones(1, 1)
-
-    def surface_at_half(steps, time_scaled):
-        c = SlidingModeGuidance(SMCConfig(lam=lam, k=0.0, time_scaled=time_scaled))
-        dt = 1.0 / steps
-        for i in range(steps + 1):
-            t = i * dt
-            c.correct(e0 * math.exp(-a * t), dt=dt)
-        # history index nearest t = 0.5
-        return c.history[steps // 2].s_rms
-
-    e_half = math.exp(-a * 0.5)
-    s_true = (lam - a) * e_half
-    err_30 = abs(surface_at_half(30, True) - s_true) / s_true
-    err_300 = abs(surface_at_half(300, True) - s_true) / s_true
-    assert err_300 < err_30 / 5             # first-order convergence (O(dt))
-    assert err_300 < 0.03                   # lam*e_{t-1} term costs lam*a*dt = 2% at 300 steps
-    # unscaled: derivative term is O(dt) so the surface is ~ lam*e, independent of a
-    s_unscaled = surface_at_half(300, False)
-    assert abs(s_unscaled - lam * e_half) / (lam * e_half) < 0.02
-
-
-def _integrator_plant(cfg, steps=400, drift=0.6, gain=1.0, e0=1.0, dt=None):
-    """Scalar plant where the correction has authority over the next error:
-        e_{t+1} = e_t + dt * (drift + gain * delta_t)
-    Returns the controller (for diagnostics) and the |s| trace it saw."""
-    dt = 1.0 / steps if dt is None else dt
-    c = SlidingModeGuidance(cfg)
-    e = torch.tensor([[e0]])
-    for _ in range(steps):
-        e_app = c.correct(e, dt=dt)
-        delta = e_app - e
-        e = e + dt * (drift + gain * delta)
-    return c
-
-
-def test_super_twisting_limit_cycles_on_a_relative_degree_zero_surface():
-    """s = e_dot + lam*e depends ALGEBRAICALLY on the correction (the correction
-    changes e_dot at once), so s has relative degree zero. Super-twisting is
-    designed for s_dot = u + d (relative degree one). On this plant it settles
-    into the 2-cycle |s_{t+1}| = k1*sqrt(|s_t|)  ->  |s| = k1^2, alternating
-    sign every step. This is a property of the paper's surface, not a bug."""
-    lam, k1 = 2.0, 1.5
-    sta_cfg = SMCConfig(lam=lam, k=k1, k2=3.0, super_twisting=True, time_scaled=True,
-                        switching="sat", phi=0.05, z_max=5.0, store_corrected=False)
-    c = _integrator_plant(sta_cfg)
-    tail = c.history[int(0.8 * len(c.history)):]
-    s_tail = sum(h.s_rms for h in tail) / len(tail)
-    assert abs(s_tail - k1 ** 2) / k1 ** 2 < 0.15
-    assert sum(h.chatter for h in tail) / len(tail) > 0.95          # flips every step
-
-
-def test_sta_integrator_is_clamped_by_z_max():
-    cfg = SMCConfig(lam=6.0, k=0.1, k2=10.0, super_twisting=True, time_scaled=True,
-                    switching="sat", phi=0.6, z_max=0.25)
-    c = SlidingModeGuidance(cfg)
-    e = torch.ones(1, 4)
-    for _ in range(200):
-        c.correct(e, dt=0.1)
-    assert c.history[-1].z_rms <= 0.25 + 1e-6
-
-
-def test_adaptive_gain_grows_outside_band_and_shrinks_inside():
-    cfg = SMCConfig(lam=6.0, k=0.1, adaptive=True, adapt_rate=1.0, adapt_band=0.5,
-                    k_min=0.02, k_max=1.0, time_scaled=True, switching="sat", phi=0.6,
-                    store_corrected=False)
-    c = SlidingModeGuidance(cfg)
-    big = torch.full((1, 8), 2.0)                       # rms(s) = 12 > band
-    ks = []
-    for _ in range(50):
-        c.correct(big, dt=0.1)
-        ks.append(float(c.gain.mean()))
-    assert all(b >= a for a, b in zip(ks, ks[1:])) and ks[-1] == pytest.approx(1.0)
-    small = torch.full((1, 8), 0.25 / 6.0)              # rms(s) = 0.25 < band: inside, not negligible
-    for _ in range(400):
-        c.correct(small, dt=0.1)
-    assert float(c.gain.mean()) == pytest.approx(0.02)   # Plestan's law decays at rate ~ rms(s)
-
-
-def test_relative_gain_is_scale_free():
-    """Scaling e by 10 scales the correction by 10 when k is relative."""
-    c1 = SlidingModeGuidance(SMCConfig(lam=6.0, k=0.05, relative_gain=True))
-    c2 = SlidingModeGuidance(SMCConfig(lam=6.0, k=0.05, relative_gain=True))
-    e = torch.randn(2, 16)
-    d1 = c1.correct(e) - e
-    d2 = c2.correct(10 * e) - 10 * e
-    assert torch.allclose(d2, 10 * d1, atol=1e-5)
 
 
 def test_excess_only_is_exact_cfg_at_w_one_and_scales_the_correction():
@@ -238,35 +154,37 @@ def test_excess_only_is_exact_cfg_at_w_one_and_scales_the_correction():
     (w-1)e gives exactly CFG at w = 1 and (w-1)/w of the correction otherwise."""
     lam, k = 6.0, 0.1
     e = torch.randn(3, 16)
-    c1 = SlidingModeGuidance(presets.boundary_layer_excess(lam, k))
-    assert torch.equal(c1.correct(e, w=1.0), e)
-    c3 = SlidingModeGuidance(presets.boundary_layer_excess(lam, k))
-    ref = SlidingModeGuidance(presets.boundary_layer(lam, k))
-    delta_full = ref.correct(e) - e
-    assert torch.allclose(c3.correct(e, w=3.0), e + (2.0 / 3.0) * delta_full, atol=1e-6)
-    with pytest.raises(ValueError):
-        SlidingModeGuidance(presets.boundary_layer_excess(lam, k)).correct(e)   # w missing
+    assert torch.equal(SlidingModeGuidance(presets.boundary_layer_excess(lam, k)).correct(e, w=1.0), e)
+
+    delta_full = SlidingModeGuidance(presets.boundary_layer(lam, k)).correct(e) - e
+    got = SlidingModeGuidance(presets.boundary_layer_excess(lam, k)).correct(e, w=3.0)
+    assert torch.allclose(got, e + (2.0 / 3.0) * delta_full, atol=1e-6)
+
+    with pytest.raises(ValueError):                             # w is required
+        SlidingModeGuidance(presets.boundary_layer_excess(lam, k)).correct(e)
 
 
-def test_warmup_returns_zero_guidance_then_resumes():
-    c = SlidingModeGuidance(SMCConfig(lam=6.0, k=0.1, warmup_steps=2))
-    e = torch.randn(1, 4)
-    assert torch.equal(c.correct(e), torch.zeros_like(e))
-    assert torch.equal(c.correct(e), torch.zeros_like(e))
-    assert torch.allclose(c.correct(e), e - 0.1 * torch.sign(e))
+def test_relative_gain_is_scale_free():
+    """Scaling e by 10 scales the correction by 10, so one k transfers across
+    models whose velocity scales differ."""
+    e = torch.randn(2, 16)
+    cfg = SMCConfig(lam=6.0, k=0.05, relative_gain=True)
+    d1 = SlidingModeGuidance(cfg).correct(e) - e
+    d2 = SlidingModeGuidance(cfg).correct(10 * e) - 10 * e
+    assert torch.allclose(d2, 10 * d1, atol=1e-5)
 
 
 def test_configuration_validation():
     with pytest.raises(ValueError):
         SlidingModeGuidance(SMCConfig(switching="sat", phi=0.0))
     with pytest.raises(ValueError):
-        SlidingModeGuidance(SMCConfig(time_scaled=True)).correct(torch.zeros(1, 2))
-    with pytest.raises(ValueError):
         SlidingModeGuidance(SMCConfig(k=-1.0))
+    with pytest.raises(ValueError):
+        SlidingModeGuidance(SMCConfig(switching="tanh"))
 
 
 # --------------------------------------------------------------------------
-# Toy plant: the field must actually be the flow-matching field
+# The toy plant must really be a flow-matching plant
 # --------------------------------------------------------------------------
 
 def test_single_gaussian_flow_transports_noise_to_target():
@@ -278,40 +196,44 @@ def test_single_gaussian_flow_transports_noise_to_target():
     assert torch.allclose(x.std(0), sd.expand(3), atol=0.04)
 
 
-def test_unguided_conditional_sampling_recovers_class_and_bayes_rate():
-    plant = ring_mixture(k=8, radius=4.0, std=0.75)
+def test_unguided_sampling_recovers_the_class_and_its_bayes_rate():
+    plant = ring_mixture(k=8, radius=4.0, std=1.5)
     x, _ = plant.sample(n=6000, cond=0, w=1.0, steps=200, seed=0)
-    assert plant.frechet_distance(x, 0) < 0.12
+    assert plant.frechet_distance(x, 0) < 0.15
     truth = plant.true_class_samples(6000, 0, seed=5)
     bayes = plant.class_accuracy(truth, 0)
-    assert 0.5 < bayes < 1.0                     # classes overlap: guidance has a job
+    assert 0.5 < bayes < 1.0            # classes overlap, so guidance has a job
     assert abs(plant.class_accuracy(x, 0) - bayes) < 0.03
 
 
 def test_cfg_trades_fidelity_for_alignment():
+    """The whole reason a better guidance law could matter."""
     plant = ring_mixture()
     x1, _ = plant.sample(n=3000, cond=0, w=1.0, steps=30, seed=0)
     x5, _ = plant.sample(n=3000, cond=0, w=5.0, steps=30, seed=0)
-    assert plant.class_accuracy(x5, 0) > plant.class_accuracy(x1, 0)
+    assert plant.class_confidence(x5, 0) > plant.class_confidence(x1, 0)
     assert plant.frechet_distance(x5, 0) > plant.frechet_distance(x1, 0)
 
 
 def test_frechet_distance_of_true_samples_is_small():
     plant = ring_mixture()
-    assert plant.frechet_distance(plant.true_class_samples(6000, 0), 0) < 0.08
+    assert plant.frechet_distance(plant.true_class_samples(6000, 0), 0) < 0.1
 
 
 def test_error_jacobian_matches_autograd():
+    """E4 rests on this Jacobian, so check the finite differences against
+    autograd. The tolerance is set by float32 round-off in the central
+    difference (~eps_machine * |e| / h), not by the truncation error."""
     plant = ring_mixture(k=4, dim=2)
     x = torch.randn(3, 2) * 2
     J_fd = plant.error_jacobian(x, 0.5, cond=0)
     for b in range(3):
         J_ad = torch.autograd.functional.jacobian(lambda z: plant.error(z[None], 0.5, 0)[0], x[b])
-        assert torch.allclose(J_fd[b], J_ad, atol=1e-3)
+        assert torch.allclose(J_fd[b], J_ad, atol=5e-3, rtol=1e-2)
 
 
 # --------------------------------------------------------------------------
-# The diffusers seam, with a dummy denoiser
+# The diffusers seam, against a dummy denoiser
 # --------------------------------------------------------------------------
 
 class _Dummy(torch.nn.Module):
@@ -333,26 +255,27 @@ class _Dummy(torch.nn.Module):
 
 
 @pytest.mark.parametrize("container", ["tensor", "tuple", "sample"])
-def test_hook_makes_pipeline_cfg_formula_equal_paper_law(container):
+def test_hook_makes_the_pipeline_cfg_formula_equal_the_paper_law(container):
+    """The pipeline's own `uncond + w*(cond - uncond)` must come out equal to
+    Algorithm 1 line 13 once the hook has rewritten the conditional branch."""
     torch.manual_seed(1)
     w = 7.5
     model = _Dummy(container)
     lat = torch.randn(2, 4, 8, 8)
-    x = torch.cat([lat, lat])                                # [uncond, cond] doubled batch
+    x = torch.cat([lat, lat])                        # [uncond, cond] doubled batch
+
     raw = GuidanceHook._extract(model(x, timestep=torch.tensor([1000.0])))
     unc_ref, cond_ref = raw.chunk(2)
-    ref_ctrl = SlidingModeGuidance(presets.paper())
-    expected = unc_ref + w * ref_ctrl.correct(cond_ref - unc_ref)
+    expected = unc_ref + w * SlidingModeGuidance(presets.paper()).correct(cond_ref - unc_ref)
 
-    hook = GuidanceHook(model, SlidingModeGuidance(presets.paper()), default_dt=1 / 30).attach()
+    hook = GuidanceHook(model, SlidingModeGuidance(presets.paper())).attach()
     try:
         out = GuidanceHook._extract(model(x, timestep=torch.tensor([1000.0])))
     finally:
         hook.detach()
     unc, cond = out.chunk(2)
-    got = unc + w * (cond - unc)                             # what every pipeline computes
-    assert torch.allclose(got, expected, atol=1e-6)
-    assert torch.equal(unc, unc_ref)                         # unconditional branch untouched
+    assert torch.allclose(unc + w * (cond - unc), expected, atol=1e-6)
+    assert torch.equal(unc, unc_ref)                 # unconditional branch untouched
 
 
 def test_hook_is_transparent_when_k_is_zero_and_detaches_cleanly():
@@ -363,15 +286,3 @@ def test_hook_is_transparent_when_k_is_zero_and_detaches_cleanly():
     assert torch.equal(model(x, timestep=torch.tensor([500.0])), ref)
     hook.detach()
     assert model.forward.__func__ is _Dummy.forward
-
-
-def test_hook_derives_dt_from_consecutive_timesteps():
-    model = _Dummy()
-    ctrl = SlidingModeGuidance(SMCConfig(lam=6.0, k=0.1, time_scaled=True))
-    hook = GuidanceHook(model, ctrl, num_train_timesteps=1000.0, default_dt=1 / 30).attach()
-    x = torch.randn(2, 3)
-    model(x, timestep=torch.tensor([1000.0]))
-    model(x, timestep=torch.tensor([966.6667]))
-    hook.detach()
-    assert ctrl.history[0].dt == pytest.approx(1 / 30)
-    assert ctrl.history[1].dt == pytest.approx(0.0333333, abs=1e-6)

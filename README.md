@@ -1,157 +1,148 @@
-# Closed-Loop Guidance in Score Distillation
+# CFG-Ctrl, reimplemented and measured
 
-Feedback control of guidance strength when the plant is an **optimisation**
-rather than a sampling trajectory.
+A control-engineering study of
 
-The guidance primitives are inherited from my undergraduate thesis and vendored
-unchanged (see [PROVENANCE.md](PROVENANCE.md)). **The control layer is new.**
-That line is where the contribution starts.
+> **CFG-Ctrl: Control-Based Classifier-Free Diffusion Guidance**
+> Wang, Liu, Chi, Liu, Xue, Duan. CVPR 2026. [arXiv:2603.03281](https://arxiv.org/abs/2603.03281)
+
+The paper writes the flow-matching sampler as a controlled ODE, shows that
+classifier-free guidance is a **proportional controller** with gain `w` acting
+on the semantic error `e = v(x,t,c) - v(x,t,∅)`, and replaces the fixed gain
+with a **sliding-mode** correction:
+
+```
+s       = ė + λe                    sliding surface     (Eq. 19)
+Δe      = -k · sign(s)              switching control   (Eq. 25)
+v̂       = v_uncond + w · (e + Δe)   applied velocity    (Alg. 1)
+```
+
+This repository reimplements that law, then measures it on a plant where the
+answer is known. What the measurements found, and what to do about it, is in
+[docs/CFG-Ctrl_Review_and_Improvements.md](docs/CFG-Ctrl_Review_and_Improvements.md),
+which doubles as a control-theory refresher: every concept the paper uses is
+re-derived where it first appears.
 
 ---
 
-## What this is asking
+## The short version
 
-The control view of diffusion guidance is already established for *sampling*:
-[CFG-Ctrl](https://arxiv.org/abs/2603.03281) (CVPR 2026) shows that vanilla
-classifier-free guidance is a fixed-gain proportional controller and proposes a
-sliding-mode replacement; other work does closed-loop or state-dependent
-guidance during denoising.
+- **The sliding surface is essentially `λe`.** With `λ = 6` over 30 steps the
+  derivative term decides the sign of `s` in about 1–2 % of elements, so the
+  law reduces to a per-element **sign-shrink** `e ← e - k·sign(e)`. This is
+  also why the paper's own `λ` ablation is flat.
+- **It chatters, and the chatter is self-inflicted.** The authors store the
+  *corrected* error as memory. Once `|e| < k` the surface is dominated by the
+  previous correction, so every element flips sign each step and `rms(s)`
+  plateaus at `(λ-1)k` instead of reaching zero.
+- **The feedback loop the proof needs does not exist.** The measured one-step
+  gain from the correction to the next error is *negative* and small
+  (median `dt·w·‖J‖` of 0.006–0.045 against `k = 0.1`). Assumption 2 holds 0 %
+  of the time; the reaching condition holds 3–16 %. The law works as
+  **open-loop shaping of the guidance direction**, not as a sliding mode.
+- **Where it helps, it helps as L1 shrinkage of guidance** — which is partly
+  just a smaller effective `w`. Comparing at one fixed `w`, as the paper's
+  Table 2 does, cannot separate the two.
 
-All of it operates on a ~50-step trajectory that produces one image. Score
-distillation is a different plant:
+Three refinements survived measurement and are implemented:
 
-|  | sampling | score distillation |
+| refinement | what it does | measured effect |
 |---|---|---|
-| horizon | ~50 steps | 200–3000 iterations |
-| state | transient | accumulates, cannot be reset |
-| input | bounded, rarely saturates | saturates |
-| per-step quality oracle | available | not available |
-
-Integral action and anti-windup only *mean* anything in the second column.
-So the question is what changes when you close the loop there, and the claim is
-evaluated on an axis the sampling literature does not report: **variance across
-seeds**.
-
-The prediction, from the sensitivity function of a linearised loop:
-
-```
-open loop:    Var(p) = Var(d)
-closed loop:  Var(p) = Var(d) / (1 + g*K_p)^2
-```
-
-Seed-to-seed variance of the final metrics should fall roughly as
-`1/(1+g*K_p)^2` as `K_p` rises from zero, then rise again once
-measurement-noise amplification dominates. That curve is the paper. Either the
-sweep produces it or it does not.
-
-Full design document: `docs/ClosedLoopGuidance.md` in the thesis repository.
-
----
-
-## Two plants, one controller
-
-```
-Plant A   DDS on an image latent     ~200-500 iters   cheap    n = 20+ seeds
-Plant B   DDS on a NeRF              3000 iters       costly   n = 3-5 seeds
-          same controller, same gains, no retuning
-```
-
-Plant A is **not** 2D sampling. There is no denoising loop; it optimises a
-persistent latent with the delta-denoising gradient. That is deliberate: 2D
-sampling is the crowded setting, 2D score distillation is not.
+| `switching="sat"` | boundary layer of half-width `φ = kλ`; makes the law exact **soft-thresholding** | `rms(s)` → 0.010 instead of a 0.50 plateau; switching activity 0.03 of full chatter at every `k`, vs 0.39–0.83 |
+| `store_corrected=False` | remember the measured error, not the corrected one | removes the alternation entirely |
+| `excess_only=True` | shrink only the extrapolation `(w-1)e` | **exactly CFG at `w = 1`**, which the paper's law is not (it is strictly dominated there) |
 
 ---
 
 ## Layout
 
 ```
-dc/            vendored guidance, byte-identical, DO NOT EDIT
-control/       NEW: measurement, reference trajectory, PI controller
-cfgctrl/       NEW: CFG-Ctrl (SMC-CFG, CVPR 2026) reimplemented + refinements,
-               analytic flow-matching toy plant, diffusers seam
-plants/        Plant A driver; ControlledDC injects u by subclassing
-bench/         PIE-Bench data + evaluation (not committed)
-experiments/   run scripts (week1_plant_id.py needs a GPU; toy_smc_cfg.py does not)
-tests/         pure-logic tests, runnable without a GPU
-results/       run outputs (gitignored)
-docs/          design docs, the CFG-Ctrl paper, and the review/improvement notes
+cfgctrl/
+    controllers.py    the guidance law + the three refinements   (k = 0 → plain CFG)
+    toy_flow.py       analytic Gaussian-mixture flow plant, closed-form everything
+    diffusers_hook.py the seam for real models (NEVER RUN ON ONE — see below)
+experiments/
+    toy_smc_cfg.py    the five experiments
+tests/                20 tests, the executable specification
+docs/                 the review + control-theory refresher
 ```
 
-The control input enters through a single seam:
-`DC._get_current_stg_scale()` — one method returning one float.
-`plants.plant_a_latent.ControlledDC` overrides it. Nothing under `dc/` is
-modified, which is what keeps the two plants provably identical.
-
-### `cfgctrl/`: the sampling-side baseline, reimplemented and audited
-
-[CFG-Ctrl](https://arxiv.org/abs/2603.03281) is the closest published work, so it
-is reimplemented here from the paper and the authors' code, model-agnostically:
-the controller only ever sees the semantic error `e = v_cond - v_uncond` and
-returns the corrected error, and `k = 0` reproduces plain CFG bit-exactly.
-
-```python
-from cfgctrl import SlidingModeGuidance, presets
-ctrl = SlidingModeGuidance(presets.paper(lam=6.0, k=0.1))          # Algorithm 1
-ctrl = SlidingModeGuidance(presets.boundary_layer(lam=6.0, k=0.1))  # chatter-free refinement
-ctrl = SlidingModeGuidance(presets.boundary_layer_excess(lam=6.0, k=0.1))  # + exactly CFG at w=1
-v_hat = ctrl.guided_velocity(v_uncond, v_cond, w=7.5, dt=sigma_prev - sigma)
-```
-
-Because no GPU is available here, the law is *measured* on an analytic
-Gaussian-mixture flow-matching plant (`cfgctrl/toy_flow.py`) where the
-conditional and unconditional velocity fields, the Jacobian of `e`, and the
-target distribution are all exact:
-
-```bash
-python -m pytest tests/ -q                       # 38 tests, ~30 s, CPU
-python experiments/toy_smc_cfg.py --quick        # a few minutes, results/toy/
-python experiments/toy_smc_cfg.py                # ~25 min, the numbers in the docs
-```
-
-What it found, and what to do about it, is written up in
-`docs/CFG-Ctrl_Review_and_Improvements.md` (also a control-theory refresher).
-Short version: the paper's law reduces to a per-element sign-shrink of the
-guidance vector, its Lyapunov argument does not describe the loop it runs in,
-and a boundary layer (soft-threshold) plus measured-error memory fixes the two
-concrete defects at zero cost.
+`cfgctrl/` depends only on `torch`. The controller never sees an image, a
+model or a scheduler — just the error tensor `e` — which is what lets the same
+code run against the toy plant and against SD3.5.
 
 ---
 
 ## Setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate     # or conda
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Sanity: the only thing runnable without a GPU
-python -m pytest tests/ -v
+python -m pytest tests/ -q                   # 20 tests, ~5 s, CPU
+python experiments/toy_smc_cfg.py --quick    # ~20 s
+python experiments/toy_smc_cfg.py            # ~5 min, writes results/toy/
 ```
 
-`tests/test_controller.py::test_reduces_to_baseline_exactly` is the important
-one. `K_p = K_i = 0` must return `u_nom` on every call, so the baseline is a
-special case of the method. If that fails, every downstream number is
-meaningless.
+## Use
 
-### Data
+```python
+from cfgctrl import SlidingModeGuidance, presets
 
-PIE-Bench, from [PnPInversion](https://cure-lab.github.io/PnPInversion/)
-(ICLR 2024): 700 images, 10 editing types, each with a **source prompt, target
-prompt, editing instruction, edit subjects and an editing mask**. The
-source/target pair is what DDS consumes, the instruction is what
-InstructPix2Pix consumes, and the mask gives background-preservation metrics
-comparable to the 3D pipeline's. Place it under `bench/pie_bench/` and use
-their evaluation script so numbers sit next to published tables.
+ctrl = SlidingModeGuidance(presets.paper(lam=6.0, k=0.1))     # the paper, Algorithm 1
+ctrl = SlidingModeGuidance(presets.boundary_layer_excess())   # the recommended law
+ctrl = SlidingModeGuidance(presets.cfg_baseline())            # k = 0, plain CFG
+
+v_hat = ctrl.guided_velocity(v_uncond, v_cond, w=7.5)
+```
+
+`k = 0` reproduces classifier-free guidance **bit-exactly**, so the baseline is
+a special case of the method and any measured difference is attributable to the
+correction. `tests/test_smc_cfg.py::test_k_zero_is_exact_cfg_for_every_variant`
+is the check; if it ever fails, no number in the repository means anything.
 
 ---
 
-## Status
+## Reading order
 
-Week 0. `dc/` is copied and verified byte-identical. `control/` is written and
-unit-tested. `plants/plant_a_latent.py` is **written but never executed** —
-every `TODO(verify)` in it is an assumption about the vendored API that must be
-checked on the first GPU run.
+1. `tests/test_smc_cfg.py` — the executable spec, and the shortest way in.
+2. `cfgctrl/controllers.py` — the whole law. Only `correct()` matters:
+   measure `e` → build `s` → pick a switching function → scale by a gain → apply.
+3. `cfgctrl/toy_flow.py` — read the module docstring, which derives the
+   closed-form velocity field. That derivation is why the numbers can be trusted.
+4. `experiments/toy_smc_cfg.py` — `exp_loop_gain()` is the interesting one: it
+   *measures* the loop gain the paper assumes.
+5. `docs/CFG-Ctrl_Review_and_Improvements.md` — the write-up.
 
-`cfgctrl/` (added 2026-09-03) is unit-tested and its toy-plant experiments have
-run to completion on CPU. Its diffusers hook has **not** been executed against a
-real model. Nothing involving the score-distillation plant has produced a
-result yet.
+---
+
+## Running against a real model
+
+`cfgctrl/diffusers_hook.py` wraps the denoiser's `forward` so a pipeline's own
+CFG line produces the corrected velocity, with no pipeline patching. **It has
+never been executed against a real model.** The algebra is unit-tested against
+a dummy denoiser; the interface is not. Before trusting any output:
+
+1. Run with `presets.cfg_baseline()`. The hook short-circuits, so the image must
+   be **bit-identical** to running without the hook at the same seed.
+2. Confirm the batch order. `uncond_first=True` assumes diffusers'
+   `cat([negative, positive])`. Check which half of the chunk responds to a
+   strongly negative prompt — backwards silently inverts the guidance direction.
+3. Only then enable `presets.paper()`.
+
+```python
+from cfgctrl import SlidingModeGuidance, presets
+from cfgctrl.diffusers_hook import attach_smc_cfg
+
+hook = attach_smc_cfg(pipe, SlidingModeGuidance(presets.paper()), guidance_scale=7.5)
+hook.reset()                                  # once per image
+image = pipe("a photo of a cat", guidance_scale=7.5).images[0]
+hook.detach()
+```
+
+Flux-dev needs more: with `true_cfg_scale > 1` its pipeline runs two separate
+forward passes instead of one doubled batch.
+
+The evaluation worth running on a GPU is the **Pareto sweep over `w`** — the
+paper's Table 2 comparison done at more than one guidance scale — with seed
+error bars and the per-step signals (`rms(e)`, `rms(s)`, switching activity)
+logged. That script does not exist yet.

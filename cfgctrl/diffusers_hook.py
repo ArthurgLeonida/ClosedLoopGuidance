@@ -3,35 +3,33 @@
 The seam. Every standard diffusers text-to-image pipeline that does
 classifier-free guidance runs the denoiser once on a doubled batch,
 
-    model_input  = cat([latents, latents])
+    model_input   = cat([latents, latents])
     prompt_embeds = cat([negative_prompt_embeds, prompt_embeds])   # uncond first
-    out          = model(model_input, timestep, ...)
-    uncond, cond = out.chunk(2)
-    noise_pred   = uncond + guidance_scale * (cond - uncond)         # P-control
+    out           = model(model_input, timestep, ...)
+    uncond, cond  = out.chunk(2)
+    noise_pred    = uncond + guidance_scale * (cond - uncond)        # P-control
 
-The combination line is inside the pipeline and differs per model, so
+The combination line lives inside the pipeline and differs per model, so
 instead of patching pipelines we wrap the denoiser's `forward` and return
 
-    cat([uncond, uncond + e_applied]),   e_applied = controller.correct(cond - uncond, dt)
+    cat([uncond, uncond + e_applied]),   e_applied = controller.correct(cond - uncond)
 
 so that the pipeline's own combination yields  uncond + w * e_applied, which is
-exactly the paper's Algorithm 1 line 13. One wrapper works for SD1.5/SDXL
-(UNet2DConditionModel, output .sample) and SD3/SD3.5 (SD3Transformer2DModel,
-output .sample or a tuple) because it only touches the returned tensor.
+exactly the paper's Algorithm 1 line 13. One wrapper covers SD1.5/SDXL
+(UNet2DConditionModel, output `.sample`) and SD3/SD3.5 (SD3Transformer2DModel,
+output `.sample` or a tuple) because it only touches the returned tensor.
 
-!! STATUS: WRITTEN BUT NEVER EXECUTED ON A REAL MODEL. No GPU was available.
-!! The batch-order convention ([uncond, cond]) and the output container
-!! handling are TODO(verify) against the pipeline you actually run. The
-!! algebra itself is unit-tested with a dummy denoiser in tests/.
+!! STATUS: NEVER EXECUTED ON A REAL MODEL. The algebra is unit-tested against a
+!! dummy denoiser, but the batch-order convention ([uncond, cond]) and the
+!! output container handling are assumptions. Verify both on the first GPU run:
+!!   1. with `presets.cfg_baseline()` (k = 0) the hook short-circuits, so the
+!!      image must be BIT-IDENTICAL to running without the hook at one seed;
+!!   2. check which half of the chunk responds to a strongly negative prompt --
+!!      getting this backwards silently inverts the guidance direction.
 
-Known cases that need more than this hook:
-  * Flux-dev is guidance-distilled: with `true_cfg_scale > 1` the diffusers
-    pipeline runs *two separate* forward passes (cond, then uncond) instead
-    of one doubled batch. Wrap at the pipeline level there, or subclass the
-    pipeline's __call__ (the authors do the latter for all models).
-  * Modular diffusers has a `guiders` API (ClassifierFreeGuidance,
-    AdaptiveProjectedGuidance, ...). Subclassing its base guider is the
-    native way to add SMC-CFG once you are on modular pipelines.
+Flux-dev needs more than this hook: with `true_cfg_scale > 1` its pipeline runs
+two separate forward passes rather than one doubled batch, so wrap at the
+pipeline level there (the CFG-Ctrl authors subclass the pipeline for all models).
 """
 
 from __future__ import annotations
@@ -44,47 +42,30 @@ from .controllers import SlidingModeGuidance
 
 
 class GuidanceHook:
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        controller: SlidingModeGuidance,
-        num_train_timesteps: float = 1000.0,
-        default_dt: Optional[float] = None,
-        uncond_first: bool = True,
-        guidance_scale: Optional[float] = None,
-    ):
+    def __init__(self, model: torch.nn.Module, controller: SlidingModeGuidance,
+                 uncond_first: bool = True, guidance_scale: Optional[float] = None):
         """
         Args:
             model:      pipe.unet or pipe.transformer.
-            controller: a SlidingModeGuidance. Reset it per image (call
-                        `hook.reset()` before each pipe(...) call).
-            num_train_timesteps: flow-matching pipelines pass timestep =
-                        sigma * 1000; dt is |t_prev - t_now| / this value.
-            default_dt: used at the first step when time scaling needs a dt
-                        and no previous timestep is known (e.g. 1 / num_steps).
+            controller: a SlidingModeGuidance. Call `hook.reset()` per image.
             uncond_first: diffusers convention cat([negative, positive]).
-                        TODO(verify) for the pipeline you run.
-            guidance_scale: the w the pipeline will apply; only needed for
-                        `excess_only` controllers (pass the same value you
-                        pass to the pipeline).
+            guidance_scale: the w the pipeline will apply. Only needed for
+                        `excess_only` controllers; pass the same value you give
+                        the pipeline.
         """
         self.model = model
         self.controller = controller
-        self.num_train_timesteps = float(num_train_timesteps)
-        self.default_dt = default_dt
         self.uncond_first = uncond_first
         self.guidance_scale = guidance_scale
         self._orig_forward = None
         self._had_instance_forward = False
-        self._t_prev: Optional[float] = None
 
     # ------------------------------------------------------------ lifecycle
     def attach(self) -> "GuidanceHook":
-        if self._orig_forward is not None:
-            return self
-        self._had_instance_forward = "forward" in self.model.__dict__
-        self._orig_forward = self.model.forward
-        self.model.forward = self._forward  # type: ignore[method-assign]
+        if self._orig_forward is None:
+            self._had_instance_forward = "forward" in self.model.__dict__
+            self._orig_forward = self.model.forward
+            self.model.forward = self._forward  # type: ignore[method-assign]
         return self
 
     def detach(self) -> None:
@@ -98,7 +79,6 @@ class GuidanceHook:
 
     def reset(self) -> None:
         self.controller.reset()
-        self._t_prev = None
 
     def __enter__(self) -> "GuidanceHook":
         return self.attach()
@@ -128,30 +108,20 @@ class GuidanceHook:
         try:
             out.sample = new
             return out
-        except Exception:  # frozen dataclass
+        except Exception:                            # frozen dataclass
             return type(out)(sample=new)
-
-    def _dt_from(self, timestep: Any) -> Optional[float]:
-        if timestep is None:
-            return self.default_dt
-        t = float(torch.as_tensor(timestep).flatten()[0]) / self.num_train_timesteps
-        dt = abs(self._t_prev - t) if self._t_prev is not None else self.default_dt
-        self._t_prev = t
-        return dt
 
     def _forward(self, *args, **kwargs):
         out = self._orig_forward(*args, **kwargs)
         if self.controller.is_cfg:
-            return out                                # baseline arm: bit-identical to the pipeline
+            return out                               # baseline arm: untouched
         pred = self._extract(out)
         if pred.shape[0] % 2 != 0:
-            return out                                # no doubled batch: not CFG
-        timestep = kwargs.get("timestep", args[1] if len(args) > 1 else None)
-        dt = self._dt_from(timestep)
+            return out                               # no doubled batch: not CFG
         a, b = pred.chunk(2)
         uncond, cond = (a, b) if self.uncond_first else (b, a)
-        e_app = self.controller.correct((cond - uncond).float(), dt, w=self.guidance_scale).to(pred.dtype)
-        cond_new = uncond + e_app
+        e_app = self.controller.correct((cond - uncond).float(), w=self.guidance_scale)
+        cond_new = uncond + e_app.to(pred.dtype)
         new = torch.cat([uncond, cond_new] if self.uncond_first else [cond_new, uncond], 0)
         return self._rebuild(out, new)
 

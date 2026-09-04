@@ -3,11 +3,10 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 
-# Run outputs and data are not committed.
+# Run outputs are not committed; regenerate with experiments/toy_smc_cfg.py.
 results/
-bench/pie_bench/
 *.pt
 *.ckpt
-*.png
-*.jpg
-docs/
+
+# The paper PDF is not ours to redistribute; the write-up in docs/ is tracked.
+docs/*.pdf
