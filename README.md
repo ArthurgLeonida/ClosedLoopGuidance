@@ -61,9 +61,11 @@ cfgctrl/
     toy_flow.py       analytic Gaussian-mixture flow plant, closed-form everything
     diffusers_hook.py the seam for real models (NEVER RUN ON ONE — see below)
 experiments/
-    toy_smc_cfg.py    the five experiments
+    toy_smc_cfg.py    the five experiments — CPU, finished
+    real_model.py     drives a diffusers pipeline — GPU, never executed
 tests/                20 tests, the executable specification
 docs/                 the review + control-theory refresher
+VLAB.md               setup and run instructions for the GPU lab
 ```
 
 `cfgctrl/` depends only on `torch`. The controller never sees an image, a
@@ -75,13 +77,15 @@ code run against the toy plant and against SD3.5.
 ## Setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+conda env create -f environment.yml && conda activate clg     # or:
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
 python -m pytest tests/ -q                   # 20 tests, ~5 s, CPU
 python experiments/toy_smc_cfg.py --quick    # ~20 s
-python experiments/toy_smc_cfg.py            # ~5 min, writes results/toy/
+python experiments/toy_smc_cfg.py            # ~45 s, writes results/toy/
 ```
+
+Everything above is CPU-only. For the GPU track see [VLAB.md](VLAB.md).
 
 ## Use
 
@@ -104,30 +108,90 @@ is the check; if it ever fails, no number in the repository means anything.
 
 ## Reading order
 
-1. `tests/test_smc_cfg.py` — the executable spec, and the shortest way in.
-2. `cfgctrl/controllers.py` — the whole law. Only `correct()` matters:
-   measure `e` → build `s` → pick a switching function → scale by a gain → apply.
-3. `cfgctrl/toy_flow.py` — read the module docstring, which derives the
-   closed-form velocity field. That derivation is why the numbers can be trusted.
-4. `experiments/toy_smc_cfg.py` — `exp_loop_gain()` is the interesting one: it
-   *measures* the loop gain the paper assumes.
-5. `docs/CFG-Ctrl_Review_and_Improvements.md` — the write-up.
+About 1,300 lines of Python, and the dependency graph is a line: everything
+imports `controllers.py`, and `controllers.py` imports only `torch`. Read it in
+one sitting, in this order.
+
+**1. `cfgctrl/controllers.py` — start here (245 lines, ~30 min).**
+The whole method. Read the module docstring first: it states the paper's law in
+five lines and then each surviving refinement with the measurement that
+justified it. Then read exactly two things:
+
+- `SMCConfig` — seven fields. Three are the paper (`lam`, `k`, `switching`),
+  four are refinements. There is no hidden state anywhere else.
+- `SlidingModeGuidance.correct()` — ~40 lines and the only method that matters.
+  It has five beats, in order: **measure** `e` → **build the surface**
+  `s = (e - e_prev) + λ·e_prev` → **switch** (`sign` or `sat`) → **scale by the
+  gain** → **apply and remember**. Everything the review document argues about
+  is visible in those five beats.
+
+The one thing to hold onto: the controller never sees an image, a model, a
+scheduler or a timestep. Its entire input is the tensor `e`. That is why the
+same code drives the toy plant and SD3.5.
+
+**2. `tests/test_smc_cfg.py` (288 lines).** The executable specification, and
+the fastest way to check you understood step 1. Read three tests in particular:
+`test_reference_implementation_of_paper_law` (replays the authors' code line by
+line and asserts bit-equality — this is what makes the critique fair),
+`test_corrected_memory_alternates_once_the_error_is_small` (derives the
+chattering mechanism from first principles in ten lines), and
+`test_k_zero_is_exact_cfg_for_every_variant` (why any measured difference is
+attributable to the correction and nothing else).
+
+**3. `cfgctrl/toy_flow.py` (190 lines).** Read the module docstring, which
+derives the closed-form velocity field for a Gaussian mixture. That derivation
+is the entire reason the numbers can be trusted: the conditional field, the
+unconditional field, the Jacobian of `e` and the target distribution are all
+exact, so the paper's assumptions can be *measured* instead of assumed. Then
+read `sample()` — a guided Euler loop in 15 lines, the same shape as a
+diffusers sampler.
+
+**4. `docs/CFG-Ctrl_Review_and_Improvements.md` (947 lines).** The argument.
+§1–2 restate the paper in control language with a refresher block for every
+concept where it first appears; §3 is the critique with measurements; §4 the
+improvements; §5 the evidence tables. If you read only one section, read §3.
+
+**5. `experiments/toy_smc_cfg.py` (451 lines).** How the numbers in §5 were
+produced. `exp_loop_gain()` is the one worth studying: it *measures* the loop
+gain that the paper's Theorem 1 assumes, and finds it has the wrong sign.
+
+**6. `cfgctrl/diffusers_hook.py` and `experiments/real_model.py`** — only when
+you are ready to run on a GPU. See [VLAB.md](VLAB.md).
+
+A good self-test after step 1: on paper, work out what the law does to a single
+element with `λ = 6`, `k = 0.1` when `e = 0.05` — and then what it does to the
+same element on the next step. §2.4 of the review has the worked answer, and it
+is where the chattering result comes from.
 
 ---
 
 ## Running against a real model
 
 `cfgctrl/diffusers_hook.py` wraps the denoiser's `forward` so a pipeline's own
-CFG line produces the corrected velocity, with no pipeline patching. **It has
-never been executed against a real model.** The algebra is unit-tested against
-a dummy denoiser; the interface is not. Before trusting any output:
+CFG line produces the corrected velocity, with no pipeline patching. **Neither
+it nor `experiments/real_model.py` has ever been executed against a real
+model.** The algebra is unit-tested against a dummy denoiser; the interface to a
+real pipeline is an assumption. So the driver script checks itself first:
 
-1. Run with `presets.cfg_baseline()`. The hook short-circuits, so the image must
-   be **bit-identical** to running without the hook at the same seed.
-2. Confirm the batch order. `uncond_first=True` assumes diffusers'
-   `cat([negative, positive])`. Check which half of the chunk responds to a
-   strongly negative prompt — backwards silently inverts the guidance direction.
-3. Only then enable `presets.paper()`.
+```bash
+python experiments/real_model.py verify        # ~1 min — run this before anything else
+python experiments/real_model.py grid --w 1.0 1.5 2.0 3.0 4.5 7.0 --seeds 0 1 2
+```
+
+`verify` confirms that `k = 0` reproduces the pipeline bit-identically, works
+out which half of the doubled batch is the conditional branch (getting this
+backwards silently inverts guidance while still producing plausible images),
+and prints the first real measurement of `rms(e)`, `rms(s)` and the chatter
+index. `grid` then sweeps arm × scale × prompt × seed, writing images per
+(arm, scale) and the per-step signals to `signals.csv`.
+
+Metrics are deliberately not computed: point your own FID / CLIP tooling at the
+image directories, then plot fidelity against alignment — one curve per arm,
+one point per `w`. That Pareto view is the point (§4.7 of the review); a single
+fixed `w`, as in the paper's Table 2, cannot distinguish a better law from a
+smaller effective guidance scale.
+
+Direct use of the hook, if you want it in your own loop:
 
 ```python
 from cfgctrl import SlidingModeGuidance, presets
@@ -140,9 +204,7 @@ hook.detach()
 ```
 
 Flux-dev needs more: with `true_cfg_scale > 1` its pipeline runs two separate
-forward passes instead of one doubled batch.
+forward passes instead of one doubled batch, which `verify` will detect and
+report.
 
-The evaluation worth running on a GPU is the **Pareto sweep over `w`** — the
-paper's Table 2 comparison done at more than one guidance scale — with seed
-error bars and the per-step signals (`rms(e)`, `rms(s)`, switching activity)
-logged. That script does not exist yet.
+Full lab instructions: [VLAB.md](VLAB.md).
