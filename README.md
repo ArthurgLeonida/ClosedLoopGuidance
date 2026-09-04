@@ -67,17 +67,53 @@ sampling is the crowded setting, 2D score distillation is not.
 ```
 dc/            vendored guidance, byte-identical, DO NOT EDIT
 control/       NEW: measurement, reference trajectory, PI controller
+cfgctrl/       NEW: CFG-Ctrl (SMC-CFG, CVPR 2026) reimplemented + refinements,
+               analytic flow-matching toy plant, diffusers seam
 plants/        Plant A driver; ControlledDC injects u by subclassing
 bench/         PIE-Bench data + evaluation (not committed)
-experiments/   run scripts
+experiments/   run scripts (week1_plant_id.py needs a GPU; toy_smc_cfg.py does not)
 tests/         pure-logic tests, runnable without a GPU
 results/       run outputs (gitignored)
+docs/          design docs, the CFG-Ctrl paper, and the review/improvement notes
 ```
 
 The control input enters through a single seam:
 `DC._get_current_stg_scale()` — one method returning one float.
 `plants.plant_a_latent.ControlledDC` overrides it. Nothing under `dc/` is
 modified, which is what keeps the two plants provably identical.
+
+### `cfgctrl/`: the sampling-side baseline, reimplemented and audited
+
+[CFG-Ctrl](https://arxiv.org/abs/2603.03281) is the closest published work, so it
+is reimplemented here from the paper and the authors' code, model-agnostically:
+the controller only ever sees the semantic error `e = v_cond - v_uncond` and
+returns the corrected error, and `k = 0` reproduces plain CFG bit-exactly.
+
+```python
+from cfgctrl import SlidingModeGuidance, presets
+ctrl = SlidingModeGuidance(presets.paper(lam=6.0, k=0.1))          # Algorithm 1
+ctrl = SlidingModeGuidance(presets.boundary_layer(lam=6.0, k=0.1))  # chatter-free refinement
+ctrl = SlidingModeGuidance(presets.boundary_layer_excess(lam=6.0, k=0.1))  # + exactly CFG at w=1
+v_hat = ctrl.guided_velocity(v_uncond, v_cond, w=7.5, dt=sigma_prev - sigma)
+```
+
+Because no GPU is available here, the law is *measured* on an analytic
+Gaussian-mixture flow-matching plant (`cfgctrl/toy_flow.py`) where the
+conditional and unconditional velocity fields, the Jacobian of `e`, and the
+target distribution are all exact:
+
+```bash
+python -m pytest tests/ -q                       # 38 tests, ~30 s, CPU
+python experiments/toy_smc_cfg.py --quick        # a few minutes, results/toy/
+python experiments/toy_smc_cfg.py                # ~25 min, the numbers in the docs
+```
+
+What it found, and what to do about it, is written up in
+`docs/CFG-Ctrl_Review_and_Improvements.md` (also a control-theory refresher).
+Short version: the paper's law reduces to a per-element sign-shrink of the
+guidance vector, its Lyapunov argument does not describe the loop it runs in,
+and a boundary layer (soft-threshold) plus measured-error memory fixes the two
+concrete defects at zero cost.
 
 ---
 
@@ -115,4 +151,7 @@ unit-tested. `plants/plant_a_latent.py` is **written but never executed** —
 every `TODO(verify)` in it is an assumption about the vendored API that must be
 checked on the first GPU run.
 
-Nothing here has produced a result yet.
+`cfgctrl/` (added 2026-09-03) is unit-tested and its toy-plant experiments have
+run to completion on CPU. Its diffusers hook has **not** been executed against a
+real model. Nothing involving the score-distillation plant has produced a
+result yet.
