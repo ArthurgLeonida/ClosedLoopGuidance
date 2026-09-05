@@ -1,9 +1,10 @@
 """Drive a real diffusers pipeline through cfgctrl. Needs a GPU.
 
-!! WRITTEN BUT NEVER EXECUTED: there is no GPU on the machine where this was
-!! written. Offline tests cover dummy pipeline integration; real weights,
-!! scheduler behavior and image quality still require a GPU run. Run `verify`
-!! first; a pass covers the checked settings, not every pipeline feature.
+!! STATUS: `verify` has passed once, on SD3.5-large in bf16 at 1024x1024,
+!! 8 steps, w = 7. `grid` has not yet been run to completion, and no image
+!! metric has been computed here, so nothing in this repository yet compares
+!! image quality against the paper. Run `verify` first on your own checkpoint,
+!! scheduler and dtype; a pass covers the checked settings, not every feature.
 
 Two modes.
 

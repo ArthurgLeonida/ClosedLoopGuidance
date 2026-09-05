@@ -2,7 +2,11 @@
 
 The CPU track can be run locally. The GPU track must first verify integration
 with the exact checkpoint, pipeline, scheduler and dtype used for the experiment.
-No trained-model run was performed during this repository audit.
+
+Integration has been verified once, on SD3.5-large in bf16 at 1024x1024, 8 steps,
+w = 7: zero-gain transparency, unconditional-first batch order, and one
+controller call per solver step. That single pass covers those settings only.
+No image-quality comparison against the paper has been produced.
 
 ## 1. Use a suitable Python and PyTorch environment
 
@@ -288,7 +292,41 @@ rounding and the pipeline's CFG arithmetic. For small corrections in fp16/bf16,
 check their realized effect on the generated prediction; mathematical equivalence
 does not ensure identical low-precision rounding.
 
+### Scoring a run
+
+~~~bash
+python experiments/evaluate.py check --run results/pilot   # run this first
+python experiments/evaluate.py clip  --run results/pilot
+~~~
+
+`check` catches the failure that is otherwise silent: if prompts are paired with
+the wrong images, every score afterwards is still a plausible number. It scores
+each image against its own prompt and against a neighbour's, and fails unless
+the image prefers its own.
+
+`clip` writes `clip_scores.csv` (per image) and `clip_summary.csv`, and prints
+**paired** differences against the baseline arm: the same prompt and seed,
+differenced, with a 95 % interval bootstrapped over prompts. Pairing matters
+because prompt difficulty dominates the spread of CLIP score and would
+otherwise hide the effect. A starred row is one whose interval excludes zero;
+with a handful of prompts that interval is wide and a star is weak evidence.
+
+FID is deliberately not implemented here. Its value depends on the Inception
+weights, the resize and the sample count, so a local reimplementation gives a
+number that is internally consistent but not comparable to any published table.
+Use a standard tool, and note it needs thousands of images — on a pilot it is
+dominated by sample-size bias:
+
+~~~bash
+pip install clean-fid
+python -c "from cleanfid import fid; print(fid.compute_fid('results/run/paper/w3.0', 'data/reference/coco'))"
+~~~
+
 Evaluate held-out fidelity, alignment and diversity across guidance scales with
 paired prompts and seeds, then compare at matched alignment and compute.
-Lower chatter alone does not demonstrate better images. Follow the
-[improvement roadmap](docs/Improvement_Roadmap.md) for the comparison protocol.
+Lower chatter alone does not demonstrate better images, and neither does a
+higher CLIP score on its own: attenuating guidance moves fidelity and alignment
+together along one curve, so a law that only lowers the effective scale will
+show a "better" number on whichever of the two axes you look at alone. Follow
+the [improvement roadmap](docs/Improvement_Roadmap.md) for the comparison
+protocol.

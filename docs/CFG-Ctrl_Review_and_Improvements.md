@@ -338,7 +338,8 @@ Two corollaries.
 
 * **Store the measured error and the plateau disappears.** With measured
   memory the surface has no self-reference; with the boundary layer of §4.1
-  $\mathrm{rms}(s)$ falls to $\sim 10^{-3}$ (E2).
+  $\mathrm{rms}(s)$ falls to $\sim 10^{-3}$ (E2). This now also holds on a
+  trained model, by a factor of 4.5 rather than the toy's 50: see below.
 * **With $\lambda < 1$ the same loop locks a bias.** The coefficient
   $(\lambda - 1)$ becomes negative, $\mathrm{sign}(s_t) = -\mathrm{sign}(\Delta e_{t-1})$,
   so $\Delta e_t = \Delta e_{t-1}$: whatever the correction was when $e$
@@ -356,6 +357,54 @@ Two corollaries.
 > the plant low-pass-filters it (a motor's inertia) and harmful when it does
 > not (here: every element of the velocity field jitters by $\pm wk$, and the
 > network sees that jitter at the next step).
+
+#### Confirmed on SD3.5-large
+
+The mechanism above was derived on a Gaussian mixture. It was then measured on a
+real model with `experiments/real_model.py verify`: SD3.5-large, bf16,
+1024x1024 (latent $16\times128\times128$, $D = 262\,144$), 30 steps, $w = 7$,
+$\lambda = 6$, $k = 0.1$, one prompt, one seed.
+
+| | $\mathrm{rms}(e)$ | $\mathrm{rms}(s)$ | chatter (last 5) | derivative decides |
+|---|---|---|---|---|
+| paper, corrected memory | 0.0997 -> 0.0094 | 0.5983 -> **0.5168** | **0.991** | 1.9 % |
+| `store_corrected=False` | 0.0997 -> 0.0093 | 0.5983 -> **0.1139** | **0.267** | 2.0 % |
+
+Two predictions of this section hold quantitatively.
+
+* **The first step initializes $\hat e_{-1} := e_0$, so $s_0 = \lambda e_0$.**
+  Predicted $6 \times 0.0997 = 0.5982$; measured $0.5983$.
+* **Corrected memory pins $\lVert s\rVert$ at $(\lambda-1)k$** once
+  $\lvert e\rvert \ll k$. Predicted $5 \times 0.1 = 0.500$; measured $0.5168$ at
+  30 steps and $0.5250$ at 8 steps, so it is a fixed point of the recurrence
+  rather than a step-count artefact. Over the run $\mathrm{rms}(e)$ fell
+  $10.6\times$ while $\mathrm{rms}(s)$ fell $1.2\times$: the surface stops
+  tracking the error and sits on the correction it made last step.
+
+Swapping to measured memory changes only the controller's own state, and the
+plateau goes: $\mathrm{rms}(s)$ is $4.5\times$ lower, chatter $3.7\times$ lower,
+and $\mathrm{rms}(s)$ now falls $5.3\times$ over the run, tracking the error as
+a sliding variable should. The derivative-decides index is unchanged at about
+2 %, confirming §3.1 on a real model too: with $\lambda = 6$ the surface is
+essentially $\lambda e$ either way.
+
+Three honest limits on this measurement. Chatter drops to 0.267, not to the
+toy's 0.00, because the trained model's own error changes sign between steps for
+about a quarter of the elements; only the self-inflicted part is removed.
+The final $\mathrm{rms}(e)$ is the same to 1.1 % across the two arms, which is
+consistent with the small loop gain of §3.3 but is a coarse summary and not
+proof of it. And **none of this is an image-quality result**: it measures the
+controller's internal behaviour, not what the sampler produces.
+
+One further observation that the toy could not have produced, because it
+depends on the trained model's velocity scale. The elementwise correction has
+norm $k\sqrt D = 51.2$, while the measured error has norm 51.0 at the first
+step and 3.6 at the last. At the paper's $k$ the correction is the same size as
+the entire error at the start and $14\times$ larger than it at the end, so late
+in sampling the applied error is dominated by the $\pm k$ sign pattern rather
+than by the semantic error. That it does not visibly wreck the output is
+plausibly because the pattern alternates and consecutive Euler steps cancel
+much of it. It is a concrete argument for the scale-free gain of §4.4.
 
 ### 3.3 The loop gain has the wrong sign and is negligible
 

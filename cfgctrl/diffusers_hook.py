@@ -19,9 +19,12 @@ exactly the paper's Algorithm 1 line 13. One wrapper covers SD1.5/SDXL
 (UNet2DConditionModel, output `.sample`) and SD3/SD3.5 (SD3Transformer2DModel,
 output `.sample` or a tuple) because it only touches the returned tensor.
 
-!! STATUS: NEVER EXECUTED ON A REAL MODEL. The algebra is unit-tested against a
-!! dummy denoiser. Standard SD/SDXL/SD3 source uses [uncond, cond], but verify
-!! the installed pipeline and its output container on the first GPU run:
+!! STATUS: integration verified once, on SD3.5-large in bf16 at 1024x1024
+!! (latent 16x128x128), 8 steps, w = 7, via `experiments/real_model.py verify`:
+!! zero-gain transparency, unconditional-first batch order, and one controller
+!! call per solver step all passed. That covers those settings only. The
+!! algebra is unit-tested against a dummy denoiser; re-run verify for any other
+!! checkpoint, pipeline, scheduler, resolution or dtype, because it checks:
 !!   1. with `presets.cfg_baseline()` (k = 0) the hook short-circuits, so the
 !!      image must be BIT-IDENTICAL to running without the hook at one seed;
 !!   2. check which half of the chunk responds to a strongly negative prompt --

@@ -105,6 +105,7 @@ cfgctrl/toy_flow.py         analytic Gaussian-mixture velocity and metrics
 cfgctrl/diffusers_hook.py   adapter for active doubled-batch CFG
 experiments/toy_smc_cfg.py  five CPU studies, CSV/JSON/figures
 experiments/real_model.py   GPU integration verification and image grid
+experiments/evaluate.py     paired CLIP scoring of a grid; FID is delegated
 tests/                     reference, numerical, experiment and adapter regressions
 docs/                      corrected review and improvement roadmap
 VLAB.md                    GPU setup and verification
