@@ -10,7 +10,7 @@ from experiments import evaluate
 
 def args(**overrides):
     values = dict(run="unused", baseline="cfg", clip_model="dummy", device="cpu",
-                  check_images=6, scorer=None)
+                  check_images=6, detect=0.00325, scorer=None)
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -207,3 +207,26 @@ def test_embed_reports_an_unexpected_output_contract_clearly():
 
     with pytest.raises(RuntimeError, match="instead of image_embeds"):
         evaluate.embed(Model(), {})
+
+
+def test_prompts_needed_scales_as_one_over_target_squared():
+    """n = (1.96 sd / target)^2, so halving the detectable effect costs 4x the
+    prompts. Used to size the next run from the spread already observed."""
+    deltas = [0.01, -0.01, 0.02, -0.02, 0.0]
+    n_big = evaluate.prompts_needed(deltas, 0.01)
+    n_small = evaluate.prompts_needed(deltas, 0.005)
+    assert n_small == pytest.approx(4 * n_big)
+    assert all(map(lambda v: v != v, [evaluate.prompts_needed([0.1], 0.01),
+                                      evaluate.prompts_needed(deltas, 0.0)]))
+
+
+def test_prompts_needed_matches_the_pilot_arithmetic():
+    """Reproduces the sizing done on the 6-prompt SD3.5 pilot: a per-prompt SD
+    near 0.023 needs roughly 200 prompts to resolve the paper's CLIP gain."""
+    import math
+    sd = 0.0232
+    # two points at +-sd/sqrt(2) have sample stdev exactly sd
+    deltas = [sd / math.sqrt(2), -sd / math.sqrt(2)]
+    assert math.isclose(evaluate.prompts_needed(deltas, 0.00325),
+                        (1.96 * sd / 0.00325) ** 2, rel_tol=1e-9)
+    assert 150 < evaluate.prompts_needed(deltas, 0.00325) < 250

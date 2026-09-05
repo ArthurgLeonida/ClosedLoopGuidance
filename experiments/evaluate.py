@@ -148,6 +148,20 @@ def paired_delta(scores: Dict[Key, float], arm: str, baseline: str, w: float,
     return per_prompt
 
 
+def prompts_needed(deltas: Sequence[float], target: float) -> float:
+    """How many prompts would give a 95% half-width of `target`.
+
+    From the observed spread of per-prompt differences, assuming the same
+    spread holds at a larger sample: n = (1.96 * sd / target)^2. A planning
+    estimate for sizing the next run, not a guarantee.
+    """
+    if len(deltas) < 2 or not math.isfinite(target) or target <= 0:
+        return float("nan")
+    m = mean(deltas)
+    sd = math.sqrt(sum((d - m) ** 2 for d in deltas) / (len(deltas) - 1))
+    return (1.96 * sd / target) ** 2
+
+
 def bootstrap_ci(values: Sequence[float], resamples: int = 10000, seed: int = 0,
                  alpha: float = 0.05) -> Tuple[float, float]:
     """Percentile CI, resampling PROMPTS (the independent unit), not images."""
@@ -267,28 +281,37 @@ def cmd_clip(args) -> int:
             if not vals:
                 continue
             line = f"{arm:<12}{w:>7.2f}{mean(vals):>9.4f}"
-            delta_mean = lo = hi = float("nan")
+            delta_mean = lo = hi = need = float("nan")
             if arm != baseline:
                 per_prompt = paired_delta(scores, arm, baseline, w, n_prompts, seeds)
                 if per_prompt:
                     deltas = list(per_prompt.values())
                     delta_mean = mean(deltas)
                     lo, hi = bootstrap_ci(deltas)
+                    need = prompts_needed(deltas, args.detect)
                     flag = "" if (math.isnan(lo) or lo <= 0 <= hi) else "  *"
                     line += f"{delta_mean:>+14.4f}   [{lo:+.4f}, {hi:+.4f}]{flag}"
+                    if math.isfinite(need):
+                        line += f"   need ~{math.ceil(need)} prompts"
             print(line)
             rows.append(dict(arm=arm, w=w, mean=mean(vals), n=len(vals),
-                             paired_delta=delta_mean, ci_lo=lo, ci_hi=hi))
+                             paired_delta=delta_mean, ci_lo=lo, ci_hi=hi,
+                             prompts_needed=need))
 
     with open(run / "clip_summary.csv", "w", newline="") as fh:
         wri = csv.DictWriter(fh, fieldnames=["arm", "w", "mean", "n", "paired_delta",
-                                             "ci_lo", "ci_hi"])
+                                             "ci_lo", "ci_hi", "prompts_needed"])
         wri.writeheader()
         wri.writerows(rows)
 
     print(f"\nwrote {out_csv.name} and clip_summary.csv")
     print(f"\n  * marks a paired difference whose 95% interval excludes zero, over "
           f"{n_prompts} prompt(s).\n"
+          f"  'need ~N prompts' is what it would take to resolve an effect of "
+          f"{args.detect:g}, from the\n"
+          "  spread seen here. The default target is the CLIP gain the paper reports "
+          "for SD3.5\n"
+          "  (0.3681 -> 0.3694 raw cosine), rescaled by 2.5 to match this column.\n"
           "  With few prompts that interval is wide and a starred result is weak "
           "evidence.\n"
           "  Alignment alone does not rank guidance laws: attenuating guidance moves\n"
@@ -312,6 +335,9 @@ def main() -> int:
     ap.add_argument("--clip-model", default="openai/clip-vit-base-patch32",
                     help="the CLIPScore convention uses ViT-B/32; keep it fixed across runs")
     ap.add_argument("--device", default="cpu", help="cpu is fine for a pilot")
+    ap.add_argument("--detect", type=float, default=0.00325,
+                    help="effect size to size the next run against; the default is "
+                         "the paper's SD3.5 CLIP gain (0.0013 raw cosine) times 2.5")
     ap.add_argument("--check-images", type=int, default=6,
                     help="how many images the pairing check scores")
     args = ap.parse_args()

@@ -38,6 +38,24 @@ export CONDA_PKGS_DIRS="$CLG_PERSIST/conda/pkgs"
 export PIP_CACHE_DIR="$CLG_PERSIST/pip-cache"
 mkdir -p "$HF_HOME" "$CONDA_PKGS_DIRS" "$PIP_CACHE_DIR" "$(dirname "$CLG_ENV")" || return 1
 
+# Git reads its global config from $HOME, so identity and settings are lost on
+# relaunch too. Point git at a copy on the volume. This file holds SETTINGS
+# ONLY -- no credential is written here. See "Git credentials" in VLAB.md
+# before putting any secret on a volume other people can read.
+if command -v git >/dev/null 2>&1; then
+    export GIT_CONFIG_GLOBAL="$CLG_PERSIST/git/gitconfig"   # git >= 2.32
+    mkdir -p "$(dirname "$GIT_CONFIG_GLOBAL")" || return 1
+    [ -f "$GIT_CONFIG_GLOBAL" ] || : > "$GIT_CONFIG_GLOBAL"
+    # A container often runs as a different uid than the volume's owner, and
+    # git then refuses the repository with "detected dubious ownership".
+    # The guard keeps this to one entry across relaunches. (Under Git for
+    # Windows only, git rewrites /e/x into E:/x when storing, so the comparison
+    # never matches and entries accumulate; harmless, and not a Linux issue.)
+    if ! git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$CLG_REPO"; then
+        git config --global --add safe.directory "$CLG_REPO"
+    fi
+fi
+
 __clg_base="$(conda info --base 2>/dev/null)"
 if [ -z "$__clg_base" ]; then
     echo "conda is not on PATH" >&2
@@ -64,6 +82,12 @@ fi
 
 echo "env      $CONDA_PREFIX"
 echo "HF_HOME  $HF_HOME"
+[ -n "$GIT_CONFIG_GLOBAL" ] && echo "gitconfig $GIT_CONFIG_GLOBAL"
+if command -v git >/dev/null 2>&1 && [ -z "$(git config --global user.email)" ]; then
+    echo "         set your identity once, it will persist:"
+    echo '           git config --global user.name  "Your Name"'
+    echo '           git config --global user.email "you@example.com"'
+fi
 python - <<'PY'
 import torch
 print(f"torch    {torch.__version__}, built for CUDA {torch.version.cuda}, "

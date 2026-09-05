@@ -138,6 +138,66 @@ environment. `environment.yml` deliberately does not pin a CUDA build, so it
 alone will not reproduce a working GPU environment; the resolved file records
 what actually worked.
 
+### Git configuration and credentials
+
+`~/.gitconfig`, `~/.git-credentials` and `~/.ssh/` are all in `$HOME`, so they
+go the same way as the environment.
+
+**Configuration** is handled for you: `vlab_env.sh` exports
+`GIT_CONFIG_GLOBAL` to a file on the volume (git 2.32 and later), so identity
+and `safe.directory` survive. Set your identity once:
+
+~~~bash
+git config --global user.name  "Your Name"
+git config --global user.email "you@example.com"
+~~~
+
+It also registers the repository under `safe.directory`, because a container
+running as a different uid than the volume's owner otherwise gets
+`detected dubious ownership`. **No credential is written to that file.**
+
+**Credentials are a different decision**, because persisting one means writing
+a secret at rest on the volume. Find out who can read it first — this mount is
+named *compartilhado*, "shared":
+
+~~~bash
+stat -c '%A %U %G' /home/jovyan/compartilhado
+~~~
+
+If other people can read that path, anything stored there is readable by them,
+whichever method you pick. In many shared containers every session is `root`,
+in which case `chmod` protects nothing.
+
+Three options, in the order worth considering:
+
+1. **Persist nothing.** Cache in memory for the session, re-authenticate after
+   each relaunch. Nothing reaches disk.
+   ~~~bash
+   git config --global credential.helper 'cache --timeout=28800'
+   ~~~
+2. **A scoped, expiring token.** If you do persist one, limit the damage it can
+   do: a GitHub *fine-grained* PAT restricted to this single repository, with
+   only `Contents: read and write`, and a short expiry.
+   ~~~bash
+   install -d -m 700 "$CLG_PERSIST/git"
+   git config --global credential.helper "store --file=$CLG_PERSIST/git/credentials"
+   # the next push prompts once and writes the token in PLAINTEXT
+   chmod 600 "$CLG_PERSIST/git/credentials"
+   ~~~
+3. **An SSH deploy key on the volume.** Prefer a per-repository deploy key over
+   an account-wide key, for the same reason.
+   ~~~bash
+   ssh-keygen -t ed25519 -f "$CLG_PERSIST/git/id_ed25519" -N "" -C vlab
+   chmod 600 "$CLG_PERSIST/git/id_ed25519"
+   export GIT_SSH_COMMAND="ssh -i $CLG_PERSIST/git/id_ed25519 -o IdentitiesOnly=yes"
+   ~~~
+   Add that `export` to `vlab_env.sh` if you settle on this route.
+
+Whichever you choose, keep the secret outside the repository. `CLG_PERSIST`
+defaults to the repository's parent, so `git/` is already outside it; the
+`.gitignore` also lists `git/` in case you point `CLG_PERSIST` at the
+repository itself.
+
 Access to a gated checkpoint requires two separate steps, and a `GatedRepoError`
 or `401` at load time means one of them is missing. Accept the licence on the
 model page **with the same account you authenticate as**, then authenticate in
