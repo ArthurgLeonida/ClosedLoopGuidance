@@ -38,6 +38,27 @@ export CONDA_PKGS_DIRS="$CLG_PERSIST/conda/pkgs"
 export PIP_CACHE_DIR="$CLG_PERSIST/pip-cache"
 mkdir -p "$HF_HOME" "$CONDA_PKGS_DIRS" "$PIP_CACHE_DIR" "$(dirname "$CLG_ENV")" || return 1
 
+# HF_HOME covers both the model cache ($HF_HOME/hub) and the auth token
+# ($HF_HOME/token), so persisting it keeps the downloads AND the login.
+# These older variables take precedence over HF_HOME for part of the cache, so
+# a stale one silently sends downloads back to the container layer.
+for __clg_var in TRANSFORMERS_CACHE HUGGINGFACE_HUB_CACHE HF_HUB_CACHE; do
+    if [ -n "${!__clg_var:-}" ]; then
+        echo "warning: $__clg_var=${!__clg_var} overrides HF_HOME; unset it" >&2
+    fi
+done
+
+# If a cache was already built in the container's own home this session, moving
+# it is much cheaper than downloading it again.
+__clg_legacy="${HOME:-/root}/.cache/huggingface"
+if [ "$__clg_legacy" != "$HF_HOME" ] \
+   && [ -n "$(ls -A "$__clg_legacy" 2>/dev/null)" ] \
+   && [ -z "$(ls -A "$HF_HOME" 2>/dev/null)" ]; then
+    echo "note: $__clg_legacy has content but $HF_HOME is empty."
+    echo "      move it once instead of re-downloading:"
+    echo "        mv \"$__clg_legacy\"/* \"$HF_HOME\"/"
+fi
+
 # Git reads its global config from $HOME, so identity and settings are lost on
 # relaunch too. Point git at a copy on the volume. This file holds SETTINGS
 # ONLY -- no credential is written here. See "Git credentials" in VLAB.md
@@ -81,7 +102,11 @@ else
 fi
 
 echo "env      $CONDA_PREFIX"
-echo "HF_HOME  $HF_HOME"
+if [ -n "$(ls -A "$HF_HOME" 2>/dev/null)" ]; then
+    echo "HF_HOME  $HF_HOME  ($(du -sh "$HF_HOME" 2>/dev/null | cut -f1) cached)"
+else
+    echo "HF_HOME  $HF_HOME  (empty; first download will populate it)"
+fi
 [ -n "$GIT_CONFIG_GLOBAL" ] && echo "gitconfig $GIT_CONFIG_GLOBAL"
 if command -v git >/dev/null 2>&1 && [ -z "$(git config --global user.email)" ]; then
     echo "         set your identity once, it will persist:"

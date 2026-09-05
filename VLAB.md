@@ -138,6 +138,48 @@ environment. `environment.yml` deliberately does not pin a CUDA build, so it
 alone will not reproduce a working GPU environment; the resolved file records
 what actually worked.
 
+### The Hugging Face cache
+
+`HF_HOME` is the single knob: it covers both the model cache (`$HF_HOME/hub`)
+and the auth token (`$HF_HOME/token`), so persisting it keeps the downloads
+*and* the login. `vlab_env.sh` sets it to `$CLG_PERSIST/hf` and reports how
+much is cached, so a relaunch does not re-download SD3.5.
+
+Confirm it is actually in effect — the value the library resolves is what
+matters, not the variable:
+
+~~~bash
+python -c "from huggingface_hub import constants as c; print(c.HF_HUB_CACHE)"
+~~~
+
+Three things that silently defeat it:
+
+* **Not sourcing `vlab_env.sh` before running.** Downloads then land in
+  `$HOME/.cache/huggingface`, inside the container layer, and vanish on
+  relaunch. If that has already happened this session, move it rather than
+  downloading again — the script prints the exact `mv` when it detects this.
+* **A stale `TRANSFORMERS_CACHE`, `HUGGINGFACE_HUB_CACHE` or `HF_HUB_CACHE`.**
+  These take precedence over `HF_HOME` for part of the cache. The script warns
+  if any is set; unset it.
+* **A read-only or full volume.** Downloads then fall back or fail partway.
+
+Authenticate once and it persists with the cache, which also removes the
+"sending unauthenticated requests" warning and its lower rate limits:
+
+~~~bash
+huggingface-cli login          # writes $HF_HOME/token
+~~~
+
+Once everything you need is cached, you can skip hub round-trips entirely,
+which speeds up start-up and makes a run reproducible against a fixed cache:
+
+~~~bash
+export HF_HUB_OFFLINE=1
+~~~
+
+Anything missing then fails loudly instead of downloading, which is what you
+want during an experiment and not what you want while setting one up.
+
 ### Git configuration and credentials
 
 `~/.gitconfig`, `~/.git-credentials` and `~/.ssh/` are all in `$HOME`, so they
@@ -372,8 +414,57 @@ python experiments/real_model.py grid --resume --out results/real_sd35
 suits a wall-clock-limited allocation: resubmit the same command until it
 completes. A job killed between writing an image and its CSV rows leaves that
 image without signals; delete that PNG before resuming to regenerate both.
-Resuming does not re-check that the earlier rows came from the same settings,
-so keep one output directory per configuration.
+
+Resuming merges `config.json` rather than overwriting it, so the sweep axes
+accumulate and `evaluate.py` still sees everything in the directory. Changes
+that would make the directory self-inconsistent — a different prompt list,
+model, dtype or step count, or an arm name redefined with different settings —
+are refused, because `prompt_id` and the arm directories would otherwise mean
+different things for different images in the same run.
+
+### Long runs that outlive the terminal
+
+A full sweep is many hours, and two separate things can end it: closing the tab,
+and the platform stopping an idle container. **`nohup` only solves the first.**
+Check the second before committing to a long job — on JupyterHub an idle culler
+will stop the container regardless of what is running inside it. If there is a
+culler, prefer short jobs and `--resume`.
+
+Split the sweep by guidance scale. Each job is then an hour or two rather than
+fifteen, a complete slice of the curve lands early, and an interruption costs
+one scale instead of the run:
+
+~~~bash
+source vlab_env.sh
+mkdir -p "$CLG_PERSIST/logs"
+
+for w in 3.0 2.0 4.5 1.5 7.0; do          # middle of the curve first
+    nohup python -u experiments/real_model.py grid \
+        --arms cfg paper excess --w "$w" \
+        --prompts data/prompts/test.txt --seeds 0 \
+        --out results/coco_test --resume \
+        >> "$CLG_PERSIST/logs/grid_w$w.log" 2>&1
+done &
+echo $! > "$CLG_PERSIST/logs/grid.pid"
+~~~
+
+`python -u` matters: without it Python block-buffers stdout into a redirect and
+the log looks frozen for minutes, which is indistinguishable from a hung job.
+The log goes on the volume, so it survives a relaunch along with the images.
+
+Watch it, and check progress independently of the log:
+
+~~~bash
+tail -f "$CLG_PERSIST/logs/grid_w3.0.log"
+find results/coco_test -name '*.png' | wc -l
+kill "$(cat "$CLG_PERSIST/logs/grid.pid")"     # to stop early
+~~~
+
+If `tmux` or `screen` is available, a detached session is nicer than `nohup`:
+you can reattach and watch the live output rather than tailing a file.
+
+Whatever ends the run, the recovery is the same command again: `--resume` skips
+what is already there.
 
 Record the environment alongside results:
 

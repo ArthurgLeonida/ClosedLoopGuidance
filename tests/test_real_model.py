@@ -270,3 +270,60 @@ def test_download_failures_are_translated_into_the_fix(exc, expected):
 
 def test_unrelated_load_failures_are_left_alone():
     assert real_model._explain_load_failure(OSError("disk full"), "some/model") is None
+
+
+# --------------------------------------------------------------------------
+# Resuming one scale at a time into the same directory
+# --------------------------------------------------------------------------
+
+def base_config(**overrides):
+    cfg = dict(model="m", dtype="bf16", steps=30, prompts=["a", "b"],
+               w=[3.0], seeds=[0], arms={"cfg": {"k": 0.0}})
+    cfg.update(overrides)
+    return cfg
+
+
+def test_resume_unions_the_sweep_axes_so_earlier_scales_stay_visible():
+    """evaluate.py enumerates images from config.json, so a later narrower --w
+    must not hide the scales generated before it."""
+    merged = real_model.merge_config(base_config(w=[3.0]), base_config(w=[7.0]))
+    assert merged["w"] == [3.0, 7.0]
+    merged = real_model.merge_config(merged, base_config(w=[1.5], seeds=[1]))
+    assert merged["w"] == [1.5, 3.0, 7.0] and merged["seeds"] == [0, 1]
+
+
+def test_resume_unions_arms_and_keeps_their_settings():
+    old = base_config(arms={"cfg": {"k": 0.0}})
+    new = base_config(arms={"paper": {"k": 0.1}})
+    assert real_model.merge_config(old, new)["arms"] == {"cfg": {"k": 0.0}, "paper": {"k": 0.1}}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("prompts", ["a", "different"]), ("steps", 50), ("model", "other"), ("dtype", "fp16"),
+])
+def test_resume_refuses_changes_that_would_corrupt_the_directory(field, value):
+    with pytest.raises(ValueError, match=f"different {field!r}"):
+        real_model.merge_config(base_config(), base_config(**{field: value}))
+
+
+def test_resume_refuses_to_redefine_an_existing_arm():
+    old = base_config(arms={"paper": {"k": 0.1}})
+    new = base_config(arms={"paper": {"k": 0.7}})
+    with pytest.raises(ValueError, match="arm 'paper' had different settings"):
+        real_model.merge_config(old, new)
+
+
+def test_grid_scale_by_scale_leaves_one_config_describing_everything(monkeypatch, tmp_path):
+    """The whole point: three short jobs must be equivalent to one long one."""
+    pipe = Pipeline()
+    monkeypatch.setattr(real_model, "load_pipe", lambda *a: pipe)
+    monkeypatch.setattr(real_model, "DEFAULT_PROMPTS", ["prompt"])
+    shared = dict(out=str(tmp_path), arms=["cfg", "paper"], resume=True, seeds=[0])
+    for w in ([3.0], [7.0], [1.5]):
+        assert real_model.cmd_grid(args(w=w, **shared)) == 0
+
+    import json
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["w"] == [1.5, 3.0, 7.0]
+    assert sorted(config["arms"]) == ["cfg", "paper"]
+    assert len(list(tmp_path.glob("*/*/*.png"))) == 2 * 3      # arms x scales

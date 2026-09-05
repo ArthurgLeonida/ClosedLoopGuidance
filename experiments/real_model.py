@@ -168,6 +168,40 @@ def parse_arms(specs, lam: float, k: float) -> Dict[str, SMCConfig]:
     return table
 
 
+def merge_config(old: Dict, new: Dict) -> Dict:
+    """Union the sweep axes when resuming into an existing directory.
+
+    Running one guidance scale at a time is the sane way to spend a long sweep:
+    each job is short, and you get a complete slice early. That only works if
+    `config.json` ends up describing everything the directory holds, because
+    `evaluate.py` enumerates images from it -- otherwise the last invocation's
+    narrower `--w` would hide every scale generated before it.
+
+    Changes that would make the directory self-inconsistent are refused rather
+    than merged: a different prompt list or a redefined arm would leave
+    `prompt_id` and the arm directories meaning different things for different
+    images in the same run.
+    """
+    for field in ("model", "dtype", "steps", "prompts"):
+        if field in old and old[field] != new[field]:
+            raise ValueError(
+                f"--resume into a directory built with a different {field!r}; the "
+                "images already there would not be comparable. Use a fresh --out."
+            )
+    for name, cfg in new["arms"].items():
+        if name in old.get("arms", {}) and old["arms"][name] != cfg:
+            raise ValueError(
+                f"--resume into a directory where arm {name!r} had different "
+                "settings; give the new one another name, or use a fresh --out."
+            )
+    merged = dict(old)
+    merged.update(new)
+    merged["w"] = sorted(set(old.get("w", [])) | set(new["w"]))
+    merged["seeds"] = sorted(set(old.get("seeds", [])) | set(new["seeds"]))
+    merged["arms"] = {**old.get("arms", {}), **new["arms"]}
+    return merged
+
+
 def describe_arm(name: str, cfg: SMCConfig) -> str:
     if cfg.is_cfg:
         return f"{name:<12} plain CFG (k = 0, the baseline every other arm is measured against)"
@@ -437,13 +471,19 @@ def cmd_grid(args) -> int:
     preflight(args)
     pipe = load_pipe(args.model, args.dtype, args.device)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps({
+    cfg_path = out / "config.json"
+    config = {
         "model": args.model, "dtype": args.dtype, "steps": args.steps, "k": args.k,
-        "lam": args.lam, "w": args.w, "seeds": args.seeds, "prompts": prompts,
+        "lam": args.lam, "w": [float(x) for x in args.w],
+        "seeds": [int(s) for s in args.seeds], "prompts": prompts,
         # the resolved controller settings, not just the names, so a result
         # directory says exactly which law produced it
         "arms": {name: asdict(cfg) for name, cfg in table.items()},
-    }, indent=1), encoding="utf-8")
+    }
+    if resume and cfg_path.exists():
+        # keep every axis already generated here, so evaluate.py still sees it
+        config = merge_config(json.loads(cfg_path.read_text(encoding="utf-8")), config)
+    cfg_path.write_text(json.dumps(config, indent=1), encoding="utf-8")
 
     sig_path = out / "signals.csv"
     append = resume and sig_path.exists()
