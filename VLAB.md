@@ -127,6 +127,72 @@ built-in prompts are an integration smoke test, not enough for an image-quality
 benchmark. The runner writes images by arm and scale, `signals.csv`, and
 `config.json`. Choose a fresh output directory for each experiment.
 
+### Selecting and parameterizing the arms
+
+An arm is one guidance law. Arms are given on the command line, so changing a
+comparison needs no code edit:
+
+~~~text
+[name=]preset[:field=value,...]
+~~~
+
+Presets: `cfg` (plain CFG, `k=0`), `paper` (Algorithm 1), `boundary_layer`,
+`excess` (boundary layer on the extrapolation only). Aliases: `cfg_baseline`,
+`bl`, `sat`, `boundary_layer_excess`. Fields: `lam`, `k`, `phi`, `switching`,
+`store_corrected`, `relative_gain`, `excess_only`.
+
+To run the published law alone, at the paper's SD3.5 settings:
+
+~~~bash
+python experiments/real_model.py grid --arms cfg paper \
+    --w 1.5 3.0 7.0 --out results/paper_only
+~~~
+
+`--arms` defaults to `cfg paper excess`. Keep `cfg` in any comparison: it is the
+baseline the other arms are read against, and it is also the control on the
+integration itself, since its images must match an unhooked run.
+
+Per-arm settings override the run-wide `--lam` and `--k`:
+
+~~~bash
+python experiments/real_model.py grid \
+    --arms cfg "sd35=paper:k=0.1" "flux=paper:k=0.7" "excess:k=0.3"
+~~~
+
+`lam` and `k` are applied before the preset computes its derived values, so
+`excess:k=0.3` gets `phi = k*lam = 1.8` rather than a width left over from the
+default gain. An explicit `phi=` still wins. Note that comparing the paper at
+its per-model gains is a comparison of two tunings, not evidence about either.
+
+The name before `=` becomes the output subdirectory, which is what lets one
+preset appear twice at different settings. Without a name an arm takes its
+preset's canonical name, so two spellings of the same preset are rejected as
+duplicates instead of silently writing one law into two directories.
+
+### Check the matrix before allocating GPU time
+
+~~~bash
+python experiments/real_model.py grid --dry-run --arms cfg "flux=paper:k=0.7" --w 2.0 5.0
+~~~
+
+`--dry-run` resolves every arm, prints its settings and the image count, then
+exits without loading a model, so a wrong matrix costs seconds rather than a
+queue slot. `config.json` records the resolved controller settings per arm, not
+only their names, so a result directory states which law produced it.
+
+### Resuming an interrupted job
+
+~~~bash
+python experiments/real_model.py grid --resume --out results/real_sd35
+~~~
+
+`--resume` skips images already on disk and appends to `signals.csv`, which
+suits a wall-clock-limited allocation: resubmit the same command until it
+completes. A job killed between writing an image and its CSV rows leaves that
+image without signals; delete that PNG before resuming to regenerate both.
+Resuming does not re-check that the earlier rows came from the same settings,
+so keep one output directory per configuration.
+
 Record the environment alongside results:
 
 ~~~bash

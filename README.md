@@ -122,6 +122,12 @@ python experiments/real_model.py verify
 python experiments/real_model.py grid --w 1.5 2.0 3.0 4.5 7.0 --seeds 0 1 2
 ~~~
 
+Which guidance laws run is a command-line argument, not a code edit:
+`--arms cfg paper` for the published law against its baseline,
+`--arms cfg "flux=paper:k=0.7" "excess:k=0.3"` to name and parameterize each
+arm. Add `--dry-run` to resolve the matrix without loading a model, and
+`--resume` to continue a job that hit a time limit. See [VLAB.md](VLAB.md).
+
 Run `verify` before a grid. The grid requires active doubled-batch CFG and
 scales strictly greater than one. Pipelines commonly skip the unconditional
 branch at `w=1`; testing the paper law there requires a direct sampler that

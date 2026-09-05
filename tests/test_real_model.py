@@ -100,3 +100,123 @@ def test_grid_writes_active_signals_and_resets_per_image(monkeypatch, tmp_path):
             assert [row["step"] for row in rows if row["arm"] == arm and row["seed"] == seed] == ["0", "1", "2"]
     assert len(list(tmp_path.glob("*/*/*.png"))) == 6
     assert "forward" not in pipe.transformer.__dict__
+
+
+# --------------------------------------------------------------------------
+# Arm specifications: the modular part of the runner
+# --------------------------------------------------------------------------
+
+def test_bare_preset_names_itself_and_uses_the_run_defaults():
+    name, cfg = real_model.parse_arm("paper", lam=6.0, k=0.1)
+    assert (name, cfg.lam, cfg.k, cfg.switching) == ("paper", 6.0, 0.1, "sign")
+    assert real_model.parse_arm("cfg", 6.0, 0.1)[1].is_cfg
+
+
+@pytest.mark.parametrize("alias,canonical", [
+    ("cfg_baseline", "cfg"), ("bl", "boundary_layer"),
+    ("sat", "boundary_layer"), ("boundary_layer_excess", "excess"),
+])
+def test_aliases_resolve_to_the_canonical_name_and_config(alias, canonical):
+    """An alias takes the canonical name, so `--arms bl boundary_layer` is
+    caught as a duplicate rather than silently running one law twice into two
+    directories. Pass `name=` when you do want two directories."""
+    assert real_model.parse_arm(alias, 6.0, 0.1) == real_model.parse_arm(canonical, 6.0, 0.1)
+    with pytest.raises(ValueError, match="both named"):
+        real_model.parse_arms([alias, canonical], 6.0, 0.1)
+
+
+def test_explicit_name_separates_the_output_directory_from_the_preset():
+    name, cfg = real_model.parse_arm("flux=paper:k=0.7", lam=6.0, k=0.1)
+    assert name == "flux" and cfg.k == 0.7 and cfg.lam == 6.0
+
+
+def test_overriding_k_rederives_the_boundary_layer_width():
+    """phi is derived from k*lam, so an overridden k must not leave a phi
+    computed from the run default. This is the trap the parser exists for."""
+    _, cfg = real_model.parse_arm("excess:k=0.3", lam=6.0, k=0.1)
+    assert cfg.k == 0.3 and cfg.phi == pytest.approx(1.8)
+    _, explicit = real_model.parse_arm("excess:k=0.3,phi=0.5", lam=6.0, k=0.1)
+    assert explicit.phi == 0.5                      # an explicit phi still wins
+
+
+def test_every_config_field_is_reachable_from_a_spec():
+    _, cfg = real_model.parse_arm(
+        "x=paper:lam=2,k=0.4,switching=sat,phi=0.9,"
+        "store_corrected=false,relative_gain=yes,excess_only=1", lam=6.0, k=0.1)
+    assert (cfg.lam, cfg.k, cfg.switching, cfg.phi) == (2.0, 0.4, "sat", 0.9)
+    assert (cfg.store_corrected, cfg.relative_gain, cfg.excess_only) == (False, True, True)
+
+
+@pytest.mark.parametrize("spec,message", [
+    ("nosuch", "unknown preset"),
+    ("paper:nosuch=1", "unknown controller field"),
+    ("paper:k", "must be field=value"),
+    ("paper:k=abc", "is not a number"),
+    ("paper:switching=relay", "must be 'sign' or 'sat'"),
+    ("paper:store_corrected=maybe", "must be true or false"),
+    ("paper:k=1,k=2", "twice"),
+    ("paper:k=-1", "must be finite and >= 0"),
+    ("a/b=paper", "path separator"),
+])
+def test_bad_specs_are_rejected_with_a_useful_message(spec, message):
+    with pytest.raises(ValueError, match=message):
+        real_model.parse_arm(spec, 6.0, 0.1)
+
+
+def test_duplicate_arm_names_are_rejected_before_they_overwrite_each_other():
+    with pytest.raises(ValueError, match="both named 'paper'"):
+        real_model.parse_arms(["paper", "paper:k=0.7"], 6.0, 0.1)
+    table = real_model.parse_arms(["paper", "flux=paper:k=0.7"], 6.0, 0.1)
+    assert list(table) == ["paper", "flux"]
+
+
+def test_verify_requires_an_arm_that_actually_switches(monkeypatch):
+    monkeypatch.setattr(real_model, "load_pipe",
+                        lambda *a: pytest.fail("validation must precede model loading"))
+    with pytest.raises(ValueError, match="every requested arm is plain CFG"):
+        real_model.cmd_verify(args(arms=["cfg"]))
+
+
+# --------------------------------------------------------------------------
+# dry-run and resume
+# --------------------------------------------------------------------------
+
+def test_dry_run_reports_the_plan_without_loading_a_model(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(real_model, "load_pipe",
+                        lambda *a: pytest.fail("a dry run must not load a model"))
+    assert real_model.cmd_grid(args(out=str(tmp_path), dry_run=True,
+                                    arms=["cfg", "flux=paper:k=0.7"])) == 0
+    printed = capsys.readouterr().out
+    assert "k=0.7" in printed and "flux" in printed
+    assert not list(tmp_path.iterdir())             # nothing written at all
+
+
+def test_config_json_records_resolved_settings_not_just_arm_names(monkeypatch, tmp_path):
+    monkeypatch.setattr(real_model, "load_pipe", lambda *a: Pipeline())
+    monkeypatch.setattr(real_model, "DEFAULT_PROMPTS", ["prompt"])
+    assert real_model.cmd_grid(args(out=str(tmp_path), arms=["flux=paper:k=0.7"])) == 0
+    import json
+    recorded = json.loads((tmp_path / "config.json").read_text())["arms"]
+    assert recorded["flux"]["k"] == 0.7 and recorded["flux"]["lam"] == 6.0
+
+
+def test_resume_skips_existing_images_and_keeps_earlier_signals(monkeypatch, tmp_path):
+    monkeypatch.setattr(real_model, "load_pipe", lambda *a: Pipeline())
+    monkeypatch.setattr(real_model, "DEFAULT_PROMPTS", ["prompt"])
+    shared = dict(out=str(tmp_path), seeds=[0], arms=["cfg", "paper"])
+    assert real_model.cmd_grid(args(**shared)) == 0
+    images = sorted(p.name for p in tmp_path.glob("*/*/*.png"))
+    signals = (tmp_path / "signals.csv").read_text()
+
+    calls = []
+    original = real_model.generate
+    monkeypatch.setattr(real_model, "generate",
+                        lambda *a, **kw: (calls.append(1), original(*a, **kw))[1])
+    assert real_model.cmd_grid(args(resume=True, **shared)) == 0
+    assert calls == []                              # every image was already present
+    assert sorted(p.name for p in tmp_path.glob("*/*/*.png")) == images
+    assert (tmp_path / "signals.csv").read_text() == signals
+
+    (tmp_path / "paper" / "w2.0" / "p00_s0.png").unlink()
+    assert real_model.cmd_grid(args(resume=True, **shared)) == 0
+    assert len(calls) == 1                          # only the deleted one regenerated

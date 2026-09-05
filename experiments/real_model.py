@@ -47,8 +47,9 @@ import json
 import math
 import sys
 import time
+from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -67,14 +68,118 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def arms(k: float, lam: float) -> Dict[str, SMCConfig]:
-    """The three laws worth comparing. `cfg` must be first: it is the baseline
-    every other row is measured against."""
-    return {
-        "cfg": presets.cfg_baseline(),
-        "paper": presets.paper(lam, k),
-        "excess": presets.boundary_layer_excess(lam, k),
-    }
+# --------------------------------------------------------------- arm specs
+# An "arm" is one guidance law to compare. Arms are given on the command line
+# as strings so a new comparison needs no code change:
+#
+#     paper                      the published law at the run's --lam/--k
+#     paper:k=0.7                the published law at Flux's gain
+#     excess                     boundary layer on the extrapolation only
+#     flux=paper:k=0.7           the same, but written to results/flux/
+#     bl:switching=sign,phi=0    any SMCConfig field, comma separated
+#
+# Grammar: [name=]preset[:field=value,...]. `lam` and `k` are applied before
+# the preset builds its derived values, so `excess:k=0.7` gets the matching
+# boundary layer phi = k*lam rather than one left over from the default k.
+PRESETS = {
+    "cfg": presets.cfg_baseline,
+    "paper": presets.paper,
+    "boundary_layer": presets.boundary_layer,
+    "excess": presets.boundary_layer_excess,
+}
+_ALIASES = {"cfg_baseline": "cfg", "bl": "boundary_layer", "sat": "boundary_layer",
+            "boundary_layer_excess": "excess"}
+# The baseline first: every other arm is read relative to it.
+DEFAULT_ARMS = ["cfg", "paper", "excess"]
+_FLOAT_FIELDS = ("lam", "k", "phi")
+_BOOL_FIELDS = ("store_corrected", "relative_gain", "excess_only")
+_BOOLS = {"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False}
+
+
+def _coerce(field: str, raw: str):
+    if field in _FLOAT_FIELDS:
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"{field}={raw!r} is not a number") from None
+    if field == "switching":
+        if raw not in ("sign", "sat"):
+            raise ValueError(f"switching={raw!r} must be 'sign' or 'sat'")
+        return raw
+    if field in _BOOL_FIELDS:
+        value = _BOOLS.get(raw.lower())
+        if value is None:
+            raise ValueError(f"{field}={raw!r} must be true or false")
+        return value
+    known = ", ".join(_FLOAT_FIELDS + ("switching",) + _BOOL_FIELDS)
+    raise ValueError(f"unknown controller field {field!r}; known fields: {known}")
+
+
+def parse_arm(spec: str, lam: float, k: float) -> Tuple[str, SMCConfig]:
+    """Turn one `[name=]preset[:field=value,...]` string into (name, config)."""
+    head, _, override_text = spec.partition(":")
+    first, eq, second = head.partition("=")
+    # "name=preset" splits in two; a bare "preset" leaves everything in `first`.
+    name, preset = (first.strip(), second.strip()) if eq else ("", first.strip())
+    preset = _ALIASES.get(preset, preset)
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r} in arm {spec!r}; "
+                         f"choose from {', '.join(sorted(PRESETS))}")
+    name = name or preset
+    if "/" in name or "\\" in name:
+        raise ValueError(f"arm name {name!r} cannot contain a path separator")
+
+    overrides: Dict[str, object] = {}
+    for item in override_text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        field, eq, raw = item.partition("=")
+        if not eq:
+            raise ValueError(f"override {item!r} in arm {spec!r} must be field=value")
+        field = field.strip()
+        if field in overrides:
+            raise ValueError(f"arm {spec!r} sets {field!r} twice")
+        overrides[field] = _coerce(field, raw.strip())
+
+    # Build the preset at the effective lam/k so its derived phi matches, then
+    # lay every explicit override on top.
+    lam_eff = float(overrides.get("lam", lam))
+    k_eff = float(overrides.get("k", k))
+    cfg = PRESETS[preset]() if preset == "cfg" else PRESETS[preset](lam_eff, k_eff)
+    cfg = replace(cfg, **overrides)
+    cfg.validate()
+    return name, cfg
+
+
+def parse_arms(specs, lam: float, k: float) -> Dict[str, SMCConfig]:
+    """Resolve every arm spec, rejecting duplicate names (they share a
+    directory and would overwrite one another's images)."""
+    table: Dict[str, SMCConfig] = {}
+    for spec in specs:
+        name, cfg = parse_arm(spec, lam, k)
+        if name in table:
+            raise ValueError(f"two arms are both named {name!r}; "
+                             f"give one an explicit name, e.g. myname={spec}")
+        table[name] = cfg
+    if not table:
+        raise ValueError("at least one arm is required")
+    return table
+
+
+def describe_arm(name: str, cfg: SMCConfig) -> str:
+    if cfg.is_cfg:
+        return f"{name:<12} plain CFG (k = 0, the baseline every other arm is measured against)"
+    bits = [f"lam={cfg.lam:g}", f"k={cfg.k:g}", f"switching={cfg.switching}"]
+    if cfg.switching == "sat":
+        bits.append(f"phi={cfg.phi:g}")
+    if not cfg.store_corrected:
+        bits.append("measured-error memory")
+    if cfg.excess_only:
+        bits.append("extrapolation only")
+    if cfg.relative_gain:
+        bits.append("relative gain")
+    return f"{name:<12} " + "  ".join(bits)
 
 
 def load_pipe(model: str, dtype: str, device: str):
@@ -144,10 +249,13 @@ def cmd_verify(args) -> int:
     import numpy as np
 
     _validate_scales([args.check_w], args.check_steps)
-    if not math.isfinite(args.k) or args.k <= 0:
-        raise ValueError("verify requires k > 0 to exercise the active controller")
-    cfg = presets.paper(args.lam, args.k)
-    cfg.validate()
+    table = parse_arms(getattr(args, "arms", None) or DEFAULT_ARMS, args.lam, args.k)
+    active = [(name, cfg) for name, cfg in table.items() if not cfg.is_cfg]
+    if not active:
+        raise ValueError("verify needs an arm with k > 0 to exercise the controller, "
+                         "but every requested arm is plain CFG")
+    arm_name, cfg = active[0]
+    print(f"checking arm: {describe_arm(arm_name, cfg)}")
     pipe = load_pipe(args.model, args.dtype, args.device)
     model = denoiser(pipe)
     w, steps = args.check_w, args.check_steps
@@ -254,28 +362,39 @@ def cmd_grid(args) -> int:
                if args.prompts else DEFAULT_PROMPTS)
     if not prompts:
         raise ValueError("the prompt file must contain at least one nonempty prompt")
-    table = arms(args.k, args.lam)
-    for cfg in table.values():
-        cfg.validate()
-    pipe = load_pipe(args.model, args.dtype, args.device)
+    table = parse_arms(getattr(args, "arms", None) or DEFAULT_ARMS, args.lam, args.k)
+    resume = getattr(args, "resume", False)
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-
     total = len(table) * len(args.w) * len(prompts) * len(args.seeds)
+
     print(f"{total} images: {len(table)} arms x {len(args.w)} scales x "
           f"{len(prompts)} prompts x {len(args.seeds)} seeds")
+    for name, cfg in table.items():
+        print("  " + describe_arm(name, cfg))
+    print(f"  scales  {args.w}\n  seeds   {args.seeds}\n  steps   {args.steps}"
+          f"\n  model   {args.model} ({args.dtype})\n  out     {out}")
+    if getattr(args, "dry_run", False):
+        print("\n--dry-run: nothing generated, no model loaded.")
+        return 0
+
+    pipe = load_pipe(args.model, args.dtype, args.device)
+    out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps({
         "model": args.model, "dtype": args.dtype, "steps": args.steps, "k": args.k,
-        "lam": args.lam, "w": args.w, "seeds": args.seeds, "arms": list(table),
-        "prompts": prompts,
+        "lam": args.lam, "w": args.w, "seeds": args.seeds, "prompts": prompts,
+        # the resolved controller settings, not just the names, so a result
+        # directory says exactly which law produced it
+        "arms": {name: asdict(cfg) for name, cfg in table.items()},
     }, indent=1), encoding="utf-8")
 
     sig_path = out / "signals.csv"
-    with open(sig_path, "w", newline="") as fh:
+    append = resume and sig_path.exists()
+    with open(sig_path, "a" if append else "w", newline="") as fh:
         wri = csv.writer(fh)
-        wri.writerow(["arm", "w", "prompt_id", "seed", "step", "e_rms", "s_rms",
-                      "delta_rms", "chatter", "switch_activity", "deriv_matters", "k_eff"])
-        done, t0 = 0, time.time()
+        if not append:
+            wri.writerow(["arm", "w", "prompt_id", "seed", "step", "e_rms", "s_rms",
+                          "delta_rms", "chatter", "switch_activity", "deriv_matters", "k_eff"])
+        done, skipped, t0 = 0, 0, time.time()
         for arm, cfg in table.items():
             ctrl = SlidingModeGuidance(cfg)
             hook = attach_smc_cfg(pipe, ctrl)
@@ -285,12 +404,17 @@ def cmd_grid(args) -> int:
                     d.mkdir(parents=True, exist_ok=True)
                     for pid, prompt in enumerate(prompts):
                         for seed in args.seeds:
+                            path = d / f"p{pid:02d}_s{seed}.png"
+                            if resume and path.exists():
+                                done += 1
+                                skipped += 1
+                                continue
                             hook.reset()
                             img = generate(pipe, prompt, w, args.steps, seed, args.device)
                             if not ctrl.is_cfg and not ctrl.history:
                                 raise RuntimeError("the active controller was never called; "
                                                    "this pipeline does not support this CFG hook")
-                            img.save(d / f"p{pid:02d}_s{seed}.png")
+                            img.save(path)
                             for st in ctrl.history:
                                 wri.writerow([arm, w, pid, seed, st.step,
                                               f"{st.e_rms:.6f}", f"{st.s_rms:.6f}",
@@ -300,11 +424,14 @@ def cmd_grid(args) -> int:
                             done += 1
                             if done % 10 == 0 or done == total:
                                 el = time.time() - t0
+                                rate = el / max(done - skipped, 1)
                                 print(f"  [{done}/{total}] {el:.0f}s elapsed, "
-                                      f"~{el / done * (total - done):.0f}s left", flush=True)
+                                      f"~{rate * (total - done):.0f}s left", flush=True)
                             fh.flush()
             finally:
                 hook.detach()
+    if skipped:
+        print(f"  resumed: {skipped} image(s) already present were skipped")
 
     print(f"\nwrote {out}/  (images per arm/scale, signals in {sig_path.name})")
     print("\nNext: point a metric tool at the image directories, e.g. CLIP score for")
@@ -323,8 +450,22 @@ def main() -> int:
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--steps", type=int, default=30, help="the paper uses 30")
-    ap.add_argument("--k", type=float, default=0.1, help="paper setting for SD3.5: 0.1")
-    ap.add_argument("--lam", type=float, default=6.0)
+    ap.add_argument("--k", type=float, default=0.1,
+                    help="default gain for arms that do not set their own; SD3.5: 0.1, Flux: 0.7")
+    ap.add_argument("--lam", type=float, default=6.0,
+                    help="default sliding-surface slope for arms that do not set their own")
+    ap.add_argument("--arms", nargs="+", default=DEFAULT_ARMS, metavar="SPEC",
+                    help="guidance laws to run, as [name=]preset[:field=value,...]. "
+                         f"Presets: {', '.join(sorted(PRESETS))} (aliases: "
+                         f"{', '.join(sorted(_ALIASES))}). Fields: "
+                         f"{', '.join(_FLOAT_FIELDS + ('switching',) + _BOOL_FIELDS)}. "
+                         "Examples: 'paper' for the published law alone; 'paper:k=0.7' "
+                         "for Flux's gain; 'flux=paper:k=0.7' to name its output "
+                         f"directory. Default: {' '.join(DEFAULT_ARMS)}")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the resolved plan and exit without loading the model")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip images that already exist and append to signals.csv")
     ap.add_argument("--out", default="results/real")
     ap.add_argument("--w", type=float, nargs="+", default=[1.5, 2.0, 3.0, 4.5, 7.0],
                     help="guidance scales, all > 1 for doubled-batch CFG")
