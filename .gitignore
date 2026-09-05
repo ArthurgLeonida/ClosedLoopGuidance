@@ -9,6 +9,13 @@ results/
 *.pt
 *.ckpt
 
+# Persisted environment and caches, if CLG_PERSIST points inside the repository
+# rather than at its parent. See vlab_env.sh.
+envs/
+hf/
+pip-cache/
+conda/
+
 # Reference image sets for FID are large and not ours to redistribute.
 # Prompt lists under data/prompts/ are small and should be committed: they
 # define the experiment. Nothing in this repository is trained, so there is no

@@ -100,6 +100,44 @@ Use storage with adequate space for checkpoints and outputs. For example:
 export HF_HOME=/scratch/$USER/hf
 ~~~
 
+### Containers: what survives a relaunch
+
+In a container, only the mounted volume persists. Everything else is part of
+the container layer and is discarded on restart. Two things land outside the
+mount by default and are therefore lost:
+
+* **A named conda environment.** `conda create -n clg` places it inside the base
+  installation, for example `/root/anaconda3/envs/clg`. Create it *on the
+  volume* with a prefix instead: `conda create -p /mnt/vol/envs/clg`, activated
+  by path with `conda activate /mnt/vol/envs/clg`.
+* **The Hugging Face cache**, which defaults to `$HOME/.cache/huggingface` and
+  holds tens of gigabytes. Losing it means re-downloading every checkpoint.
+
+Do not guess which directory is mounted — ask, since a wrong guess silently
+rebuilds everything next time:
+
+~~~bash
+findmnt -n -o TARGET,FSTYPE | grep -v overlay     # bind mounts and volumes
+~~~
+
+`vlab_env.sh` in this repository does the whole thing and is idempotent:
+
+~~~bash
+source vlab_env.sh        # after every relaunch
+~~~
+
+It puts the environment, the conda package cache, the pip cache and `HF_HOME`
+on the volume (by default the directory containing this repository, which is
+the mount on a Jupyter image), creates the environment on first use, activates
+it afterwards, and prints the torch build and CUDA availability. Override the
+defaults with `CLG_PERSIST`, `CLG_ENV` and `CLG_TORCH_INDEX` — the last must
+match the driver's CUDA version, see §1.
+
+On first creation it also writes `requirements-resolved.txt` beside the
+environment. `environment.yml` deliberately does not pin a CUDA build, so it
+alone will not reproduce a working GPU environment; the resolved file records
+what actually worked.
+
 Access to a gated checkpoint requires two separate steps, and a `GatedRepoError`
 or `401` at load time means one of them is missing. Accept the licence on the
 model page **with the same account you authenticate as**, then authenticate in

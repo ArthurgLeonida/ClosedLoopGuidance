@@ -145,3 +145,65 @@ def test_clip_refuses_an_empty_run(tmp_path):
     run = make_run(tmp_path, drop={(a, 3.0, p, 0) for a in ("cfg", "paper") for p in range(3)})
     with pytest.raises(ValueError, match="no images to score"):
         evaluate.cmd_clip(args(run=str(run), scorer=lambda *a: []))
+
+
+# --------------------------------------------------------------------------
+# The transformers API contract that `clip_scores` depends on
+# --------------------------------------------------------------------------
+
+def _tiny_clip():
+    """A real CLIPModel with random weights, small enough to build in-process.
+    No download, so this can run anywhere transformers is installed."""
+    from transformers import CLIPConfig, CLIPModel
+    cfg = CLIPConfig(
+        text_config=dict(vocab_size=64, hidden_size=16, intermediate_size=32,
+                         num_hidden_layers=1, num_attention_heads=2,
+                         max_position_embeddings=16, bos_token_id=0, eos_token_id=1),
+        vision_config=dict(hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+                           num_attention_heads=2, image_size=32, patch_size=16),
+        projection_dim=8,
+    )
+    return CLIPModel(cfg).eval()
+
+
+def _tiny_inputs():
+    import torch
+    return dict(input_ids=torch.tensor([[1, 2, 3], [4, 5, 6]]),
+                attention_mask=torch.ones(2, 3, dtype=torch.long),
+                pixel_values=torch.randn(2, 3, 32, 32))
+
+
+def test_embed_returns_projected_tensors_from_a_real_clip_model():
+    """Regression: transformers 5 changed `get_image_features` to return a
+    BaseModelOutputWithPooling rather than the projected tensor, so the old code
+    raised `'BaseModelOutputWithPooling' object has no attribute 'norm'` on the
+    first real call. Go through CLIPOutput, which means the same in 4.x and 5.x."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    img, txt = evaluate.embed(_tiny_clip(), _tiny_inputs())
+    assert torch.is_tensor(img) and torch.is_tensor(txt)
+    assert img.shape == (2, 8) and txt.shape == (2, 8)   # both in the projection space
+    assert torch.isfinite(img).all() and torch.isfinite(txt).all()
+
+
+def test_get_image_features_is_not_a_tensor_on_this_transformers():
+    """Pin the reason `embed` exists. If a future transformers makes this a
+    tensor again, `embed` still works; this test just documents the contract."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    features = _tiny_clip().get_image_features(pixel_values=_tiny_inputs()["pixel_values"])
+    if not torch.is_tensor(features):
+        assert not hasattr(features, "norm")             # exactly the failure seen
+
+
+def test_embed_reports_an_unexpected_output_contract_clearly():
+    class Weird:
+        image_embeds = "not a tensor"
+        text_embeds = None
+
+    class Model:
+        def __call__(self, **kwargs):
+            return Weird()
+
+    with pytest.raises(RuntimeError, match="instead of image_embeds"):
+        evaluate.embed(Model(), {})

@@ -78,6 +78,31 @@ def load_clip(model_name: str, device: str):
     return model, CLIPProcessor.from_pretrained(model_name)
 
 
+def embed(model, inputs) -> Tuple["object", "object"]:
+    """Projected (image, text) embeddings, as tensors.
+
+    Do NOT use `get_image_features` / `get_text_features`: transformers 4.x
+    returns the projected tensor from those, while transformers 5.x returns a
+    `BaseModelOutputWithPooling` whose `pooler_output` has been replaced by that
+    tensor. Normalizing the 5.x return value raises `AttributeError: 'BaseModel
+    OutputWithPooling' object has no attribute 'norm'`. The `CLIPOutput` fields
+    used here mean the same thing in both versions.
+    """
+    import torch
+
+    out = model(**inputs)
+    img, txt = getattr(out, "image_embeds", None), getattr(out, "text_embeds", None)
+    if not (torch.is_tensor(img) and torch.is_tensor(txt)):
+        raise RuntimeError(
+            "this CLIP model returned "
+            f"{type(img).__name__}/{type(txt).__name__} instead of image_embeds "
+            "and text_embeds tensors; the installed transformers may have changed "
+            "the CLIP output contract again. Pin a known-good version, or adapt "
+            "`embed()` in this file."
+        )
+    return img, txt
+
+
 def clip_scores(paths: Sequence[Path], prompts: Sequence[str], model_name: str,
                 device: str, batch: int = 16) -> List[float]:
     """CLIPScore = 2.5 * max(cosine(image, text), 0), one per (path, prompt)."""
@@ -93,9 +118,7 @@ def clip_scores(paths: Sequence[Path], prompts: Sequence[str], model_name: str,
             imgs = [Image.open(p).convert("RGB") for p in paths[i:i + batch]]
             inputs = processor(text=list(prompts[i:i + batch]), images=imgs,
                                return_tensors="pt", padding=True, truncation=True).to(device)
-            img_emb = model.get_image_features(pixel_values=inputs["pixel_values"])
-            txt_emb = model.get_text_features(input_ids=inputs["input_ids"],
-                                              attention_mask=inputs.get("attention_mask"))
+            img_emb, txt_emb = embed(model, inputs)
             img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
             txt_emb = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
             cos = (img_emb * txt_emb).sum(-1)
