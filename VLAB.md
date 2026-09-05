@@ -60,6 +60,34 @@ The small CUDA operation checks more than device visibility alone. Use
 when memory allows. The default runner loads the full pipeline onto the device;
 memory needs depend on the checkpoint and resolution.
 
+### When `torch.cuda.is_available()` is False
+
+A frequent case reports the driver as too old on an otherwise current node:
+
+~~~text
+UserWarning: CUDA initialization: The NVIDIA driver on your system is too old (found version 12080)
+~~~
+
+`12080` is the **driver's** CUDA version, here 12.8. The message means the
+installed torch was built for a *newer* CUDA than this driver supports; it does
+not mean the driver is old in absolute terms. Compare the two directly:
+
+~~~bash
+nvidia-smi | head -3                                   # driver and its CUDA version
+python -c "import torch; print(torch.version.cuda)"    # what this wheel requires
+~~~
+
+Then install a build the driver supports. For a CUDA 12.8 driver:
+
+~~~bash
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu128
+~~~
+
+A plain `pip install torch` takes the newest default build, which is how an
+environment ends up ahead of its driver. `experiments/real_model.py` checks this
+before downloading anything, so a mismatch costs seconds instead of a partial
+multi-gigabyte download.
+
 ## 2. Storage, authentication and batch jobs
 
 Use storage with adequate space for checkpoints and outputs. For example:
@@ -68,10 +96,23 @@ Use storage with adequate space for checkpoints and outputs. For example:
 export HF_HOME=/scratch/$USER/hf
 ~~~
 
-Access to a gated checkpoint may require accepting its license and authenticating
-with Hugging Face in your environment. The default checkpoint is
-`stabilityai/stable-diffusion-3.5-large`; use `--model` to select another compatible
-checkpoint you can access.
+Access to a gated checkpoint requires two separate steps, and a `GatedRepoError`
+or `401` at load time means one of them is missing. Accept the licence on the
+model page **with the same account you authenticate as**, then authenticate in
+this environment:
+
+~~~bash
+huggingface-cli login          # or `hf auth login` on newer huggingface_hub
+# non-interactively, e.g. in a batch job:
+export HF_TOKEN=<a read token>
+python -c "from huggingface_hub import whoami; print(whoami()['name'])"
+~~~
+
+The last line confirms which identity the environment actually uses, which is
+what distinguishes "licence not accepted" from "logged in as someone else".
+The default checkpoint is `stabilityai/stable-diffusion-3.5-large`; use `--model`
+to select another compatible checkpoint you can access. The runner translates
+these download failures into the corresponding instruction.
 
 For Slurm with conda, initialize the conda shell hook before activation:
 
@@ -117,6 +158,45 @@ feature or scheduler. Repeat it after dependency, checkpoint or integration
 changes. Dummy-denoiser tests alone do not establish trained-model compatibility.
 
 ## 4. Run paired comparisons
+
+### There is no training set, and no input images
+
+Nothing in this repository is trained. The controller has no learnable
+parameters — `SMCConfig` is seven hand-set numbers — there is no optimizer, no
+gradient step and no loss anywhere in `cfgctrl/` or `experiments/`, and the
+checkpoint is downloaded frozen and run in inference mode. This is a change to
+how guidance is computed *during sampling*, not a model you fit.
+
+There is also no input image. A text-to-image pipeline starts from seeded noise
+and a prompt: `pipe(prompt, guidance_scale, num_inference_steps, generator)`.
+What you supply is **prompts**; the images are **outputs**.
+
+| what | where | commit it? |
+|---|---|---|
+| prompt lists you supply | anywhere; `--prompts path.txt`. Suggested: `data/prompts/*.txt` | yes, they are small and they define the experiment |
+| generated images, `signals.csv`, `config.json` | `results/<name>/<arm>/w<scale>/pNN_sS.png` | no, `results/` is ignored |
+| reference images, only if you compute FID | suggested `data/reference/` | no, large and not ours to redistribute |
+
+**Prompts.** One per line, UTF-8, blank lines skipped. The six built-in prompts
+are an integration smoke test. For a real comparison, take a standard set:
+MS-COCO captions are what the paper's FID and CLIP numbers use, and
+T2I-CompBench covers the compositional categories it reports. §5 of the
+[improvement roadmap](docs/Improvement_Roadmap.md) requires tuning and test
+prompts to be **disjoint**, so keep them in separate files and never tune on
+the test file:
+
+~~~bash
+python experiments/real_model.py grid --prompts data/prompts/tune.txt --out results/tune
+python experiments/real_model.py grid --prompts data/prompts/test.txt --out results/test
+~~~
+
+**Reference images are needed only for FID.** CLIP score, ImageReward, HPSv2
+and PickScore each read a generated image and its prompt, so they need no
+reference set. FID compares your generated distribution against a reference
+distribution of real images — the paper uses 5,000 MS-COCO image–text pairs.
+This repository computes no metrics at all, by design, so nothing here reads
+that directory; it is only where to put the set for whichever FID tool you run
+over `results/`.
 
 ~~~bash
 python experiments/real_model.py grid --w 1.5 2.0 3.0 4.5 7.0 --seeds 0 1 2 --out results/real_sd35

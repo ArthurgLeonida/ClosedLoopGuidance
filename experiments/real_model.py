@@ -182,12 +182,67 @@ def describe_arm(name: str, cfg: SMCConfig) -> str:
     return f"{name:<12} " + "  ".join(bits)
 
 
+def preflight(args) -> None:
+    """Fail before downloading tens of gigabytes.
+
+    A checkpoint download is the slow, expensive part of a first run, and the
+    two things that most often stop that run are visible beforehand: a torch
+    build the driver cannot run, and a gated repository.
+    """
+    device = str(getattr(args, "device", "cuda"))
+    print(f"torch {torch.__version__}, built for CUDA {torch.version.cuda}", flush=True)
+    if not device.startswith("cuda"):
+        return
+    if torch.cuda.is_available():
+        print(f"device {torch.cuda.get_device_name()}, "
+              f"bf16 {torch.cuda.is_bf16_supported()}", flush=True)
+        return
+    raise RuntimeError(
+        "torch cannot use CUDA, so this run would download the checkpoint and then "
+        f"fail.\n  This torch is built for CUDA {torch.version.cuda}.\n"
+        "  Compare it with the driver's supported version from `nvidia-smi`. A wheel "
+        "built for a NEWER CUDA than the driver supports is reported as the driver "
+        "being 'too old', which is the usual cause.\n"
+        "  Fix by installing a torch build the driver supports, e.g. for a CUDA 12.8 "
+        "driver:\n"
+        "    pip install --force-reinstall torch "
+        "--index-url https://download.pytorch.org/whl/cu128\n"
+        "  Or pass --device cpu for a correctness smoke test (far too slow for a grid)."
+    )
+
+
+def _explain_load_failure(exc: BaseException, model: str) -> Optional[RuntimeError]:
+    """Translate an opaque download failure into the action that fixes it."""
+    text, name = str(exc), type(exc).__name__
+    if "Gated" in name or "restricted" in text or "401" in text or "gated" in text:
+        return RuntimeError(
+            f"cannot access {model}: the repository is gated.\n"
+            "  1. Open its page on huggingface.co and accept the licence with the "
+            "same account you will authenticate as.\n"
+            "  2. Authenticate in this environment: `huggingface-cli login` (older "
+            "versions) or `hf auth login`, or export HF_TOKEN=<a read token>.\n"
+            "  3. Confirm with: python -c \"from huggingface_hub import whoami; "
+            "print(whoami()['name'])\"\n"
+            "  Or pass --model with a checkpoint you already have access to."
+        )
+    if "Repository Not Found" in text or "404" in text:
+        return RuntimeError(f"no such checkpoint: {model!r}. Check --model for a typo.")
+    return None
+
+
 def load_pipe(model: str, dtype: str, device: str):
     from diffusers import DiffusionPipeline
 
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype]
     print(f"loading {model} ({dtype}) ...", flush=True)
-    pipe = DiffusionPipeline.from_pretrained(model, torch_dtype=torch_dtype).to(device)
+    try:
+        pipe = DiffusionPipeline.from_pretrained(model, torch_dtype=torch_dtype)
+    except Exception as exc:                       # noqa: BLE001 - re-raised below
+        explained = _explain_load_failure(exc, model)
+        if explained is None:
+            raise
+        raise explained from exc
+    pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
     return pipe
 
@@ -256,6 +311,7 @@ def cmd_verify(args) -> int:
                          "but every requested arm is plain CFG")
     arm_name, cfg = active[0]
     print(f"checking arm: {describe_arm(arm_name, cfg)}")
+    preflight(args)
     pipe = load_pipe(args.model, args.dtype, args.device)
     model = denoiser(pipe)
     w, steps = args.check_w, args.check_steps
@@ -377,6 +433,7 @@ def cmd_grid(args) -> int:
         print("\n--dry-run: nothing generated, no model loaded.")
         return 0
 
+    preflight(args)
     pipe = load_pipe(args.model, args.dtype, args.device)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps({
@@ -477,7 +534,12 @@ def main() -> int:
     try:
         return cmd_verify(args) if args.mode == "verify" else cmd_grid(args)
     except ValueError as exc:
-        ap.error(str(exc))
+        ap.error(str(exc))                 # a bad argument: show usage
+    except RuntimeError as exc:
+        # An environment or integration problem. The message already says what
+        # to do, so print it plainly instead of a traceback.
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

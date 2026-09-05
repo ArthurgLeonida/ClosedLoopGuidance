@@ -220,3 +220,53 @@ def test_resume_skips_existing_images_and_keeps_earlier_signals(monkeypatch, tmp
     (tmp_path / "paper" / "w2.0" / "p00_s0.png").unlink()
     assert real_model.cmd_grid(args(resume=True, **shared)) == 0
     assert len(calls) == 1                          # only the deleted one regenerated
+
+
+# --------------------------------------------------------------------------
+# Preflight: fail before a multi-gigabyte download, not after
+# --------------------------------------------------------------------------
+
+def test_preflight_refuses_cuda_when_torch_cannot_use_it(monkeypatch):
+    """A torch wheel built for a newer CUDA than the driver supports reports the
+    driver as 'too old'. Catch that before downloading a checkpoint."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="would download the checkpoint and then fail"):
+        real_model.preflight(args(device="cuda"))
+
+
+def test_preflight_allows_cpu_and_working_cuda(monkeypatch, capsys):
+    real_model.preflight(args(device="cpu"))            # never inspects the GPU
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *a: "H100")
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    real_model.preflight(args(device="cuda"))
+    assert "H100" in capsys.readouterr().out
+
+
+def test_grid_preflight_runs_before_the_model_is_loaded(monkeypatch, tmp_path):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(real_model, "load_pipe",
+                        lambda *a: pytest.fail("preflight must precede the download"))
+    with pytest.raises(RuntimeError, match="torch cannot use CUDA"):
+        real_model.cmd_grid(args(out=str(tmp_path), device="cuda"))
+
+
+def test_dry_run_needs_no_gpu(monkeypatch, tmp_path):
+    """Planning a matrix must work on a login node with no driver."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert real_model.cmd_grid(args(out=str(tmp_path), device="cuda", dry_run=True)) == 0
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (type("GatedRepoError", (Exception,), {})("nope"), "accept the licence"),
+    (Exception("401 Client Error"), "accept the licence"),
+    (Exception("Access to model X is restricted"), "accept the licence"),
+    (Exception("Repository Not Found"), "Check --model for a typo"),
+])
+def test_download_failures_are_translated_into_the_fix(exc, expected):
+    explained = real_model._explain_load_failure(exc, "some/model")
+    assert explained is not None and expected in str(explained)
+
+
+def test_unrelated_load_failures_are_left_alone():
+    assert real_model._explain_load_failure(OSError("disk full"), "some/model") is None
