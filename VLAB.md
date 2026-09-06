@@ -430,27 +430,83 @@ Check the second before committing to a long job — on JupyterHub an idle culle
 will stop the container regardless of what is running inside it. If there is a
 culler, prefer short jobs and `--resume`.
 
-Split the sweep by guidance scale. Each job is then an hour or two rather than
-fifteen, a complete slice of the curve lands early, and an interruption costs
-one scale instead of the run:
+Use `run_grid.sh`, which handles the parts that are easy to get wrong:
 
 ~~~bash
 source vlab_env.sh
-mkdir -p "$CLG_PERSIST/logs"
-
-for w in 3.0 2.0 4.5 1.5 7.0; do          # middle of the curve first
-    nohup python -u experiments/real_model.py grid \
-        --arms cfg paper excess --w "$w" \
-        --prompts data/prompts/test.txt --seeds 0 \
-        --out results/coco_test --resume \
-        >> "$CLG_PERSIST/logs/grid_w$w.log" 2>&1
-done &
-echo $! > "$CLG_PERSIST/logs/grid.pid"
+nohup ./run_grid.sh results/coco_test "3.0 2.0 4.5 1.5 7.0" \
+    --arms cfg paper excess --prompts data/prompts/test.txt --seeds 0 \
+    > "$CLG_PERSIST/logs/coco_test.out" 2>&1 &
 ~~~
 
-`python -u` matters: without it Python block-buffers stdout into a redirect and
-the log looks frozen for minutes, which is indistinguishable from a hung job.
-The log goes on the volume, so it survives a relaunch along with the images.
+It runs **one scale per invocation**, which matters because `cmd_grid` loops
+over arms on the outside: a single call with every scale would finish all of
+`cfg` before starting `paper`, so there would be no complete slice of the curve
+until the very end. A scale at a time gives all arms at one scale in a couple
+of hours — enough to evaluate and decide whether to continue — and an
+interruption costs one scale rather than the run.
+
+It also sources `vlab_env.sh` if the shell has not, `cd`s to the repository so
+relative paths hold, passes `-u` so Python does not block-buffer the log into
+looking hung, timestamps each scale, records the real exit status per scale,
+continues past a failed scale rather than discarding the rest, writes a PID
+file, and takes a lock on the output directory so two sweeps cannot interleave
+rows in `signals.csv` and race on `config.json`. `--resume` is always on.
+
+Logs land in `$CLG_PERSIST/logs/<outdir>_w<scale>.log`, on the volume, so they
+survive a relaunch along with the images.
+
+Wrapping the **whole loop** in `nohup` is the point: `nohup` on each `python`
+protects the generation processes, but not the loop that launches them, so
+closing the tab could leave the running scale alive while the remaining scales
+never start.
+
+### Spreading the sweep across free GPUs
+
+One `grid` process uses one GPU: `pipe.to("cuda")`, batch size one, one image at
+a time. On a shared multi-GPU node most of the hardware therefore sits idle
+while a sweep takes a day or more. `run_sweep.sh` reads free memory per device,
+uses only the cards with room, and gives each one a share of the scales:
+
+~~~bash
+CLG_PLAN_ONLY=1 ./run_sweep.sh results/coco "3.0 2.0 4.5 1.5 7.0"   # look first
+
+nohup ./run_sweep.sh results/coco "3.0 2.0 4.5 1.5 7.0" \
+    --arms cfg paper excess --prompts data/prompts/test.txt --seeds 0 \
+    > sweep.out 2>&1 &
+~~~
+
+~~~text
+  gpu 3: 5005 MiB free -- skipping (need 45000)
+usable gpus  1 2 5 7  (4)
+  gpu 1 -> 3.0 7.0
+  gpu 2 -> 2.0
+~~~
+
+Each scale gets **its own output directory**, `results/coco_w3.0` and so on.
+Two processes writing one directory would interleave rows in `signals.csv` and
+race on `config.json`, and `run_grid.sh`'s lock would refuse the second job.
+Separate directories are self-contained: run `evaluate.py check` and `clip` on
+each, then assemble the Pareto curve across them.
+
+| knob | meaning |
+|---|---|
+| `CLG_MIN_FREE_MIB` | memory a card must have free, default 45000. SD3.5-large in bf16 measured about 35 GB; lower this to use a card that is close but under. |
+| `CLG_MAX_GPUS` | cap on cards to occupy. On a shared node, taking every free card is antisocial; 2 or 3 is usually the neighbourly choice. |
+| `CLG_PLAN_ONLY` | print the assignment and exit. |
+| `CLG_NVIDIA_SMI` | path to `nvidia-smi` if it is not on `PATH`. |
+
+Two things this cannot do. It reads free memory **once, at launch**, so a
+neighbour who allocates afterwards can still push you into an OOM — if that
+happens, raise `CLG_MIN_FREE_MIB` and resume. And each worker loads its own
+copy of the checkpoint, so five workers means five ~35 GB allocations, which is
+fine on 80 GB cards but is not free.
+
+The larger speedup is unused: generation is batch size one, which wastes an
+H100. Batching several prompts per pipeline call would give a further factor on
+each card, but it changes what `signals.csv` records — the controller state and
+its diagnostics become per batch rather than per prompt — so it is a real
+change, not a flag.
 
 Watch it, and check progress independently of the log:
 

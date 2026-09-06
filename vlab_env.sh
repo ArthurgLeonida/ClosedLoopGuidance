@@ -25,6 +25,9 @@ fi
 CLG_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLG_PERSIST="${CLG_PERSIST:-$(dirname "$CLG_REPO")}"
 CLG_ENV="${CLG_ENV:-$CLG_PERSIST/envs/clg}"
+# Exported because the documented run commands use "$CLG_PERSIST/logs", and a
+# plain shell variable would be invisible to subshells and to `bash -c`.
+export CLG_REPO CLG_PERSIST CLG_ENV
 # `nvidia-smi` reports the driver's CUDA version; the wheel must not be newer.
 CLG_TORCH_INDEX="${CLG_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 

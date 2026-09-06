@@ -4,6 +4,12 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 
+# Job logs live beside the code so `tail -f logs/...` is convenient; the repo
+# is on the mounted volume, so they persist. They are never committed.
+logs/
+*.log
+*.out
+
 # Run outputs are not committed; regenerate with experiments/toy_smc_cfg.py.
 results/
 *.pt
