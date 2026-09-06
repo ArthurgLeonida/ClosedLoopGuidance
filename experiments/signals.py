@@ -116,7 +116,6 @@ def summarise(run: Path, tail: int = 5):
             bucket["s_rms"].add(s)
             bucket["chatter"].add(float(row["chatter"]))
             deriv[key].add(float(row["deriv_matters"]))
-            switch[key].add(float(row["switch_activity"]))
             if step == 0:
                 e_first[key].add(float(row["e_rms"]))
             last = steps - 1 if steps else None
@@ -125,6 +124,10 @@ def summarise(run: Path, tail: int = 5):
                 e_final[key].add(float(row["e_rms"]))
             if last is not None and step > last - tail:
                 late_chat[key].add(float(row["chatter"]))
+                # Same window as chatter on purpose: they describe one
+                # phenomenon, and for a sign law switch should equal
+                # sqrt(chatter), which is only checkable if the windows match.
+                switch[key].add(float(row["switch_activity"]))
 
     if not rows:
         raise ValueError(f"{path} has no usable rows")
@@ -160,8 +163,10 @@ def report(res: Dict, tail: int) -> None:
     print(f"  'predicted' is (lam-1)*k, the fixed point that corrected-error memory")
     print(f"  creates once |e| < k. 'ratio' near 1.00 confirms it. Arms storing the")
     print(f"  measured error have no such fixed point and should track e down instead.")
-    print(f"  chatter and switch are averaged over the last {tail} steps; switch is")
-    print(f"  normalised by 2k, so 1.0 is full reversal every step.")
+    print(f"  chatter and switch both average the last {tail} steps; switch is")
+    print(f"  normalised by 2k, so 1.0 is full reversal every step. For a sign law")
+    print(f"  switch should equal sqrt(chatter); a mismatch means the correction is")
+    print(f"  not bang-bang. 'deriv' is averaged over the whole run.")
     print(f"  These are controller diagnostics only: they say nothing about image")
     print(f"  quality. Use evaluate.py and pareto.py for that.")
 

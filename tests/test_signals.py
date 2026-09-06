@@ -100,3 +100,29 @@ def test_missing_or_empty_inputs_are_reported(tmp_path):
     (tmp_path / "signals.csv").write_text("arm,w,step\n", encoding="utf-8")
     with pytest.raises(ValueError, match="no usable rows"):
         signals.summarise(tmp_path)
+
+
+def test_chatter_and_switch_use_the_same_window(tmp_path):
+    """They describe one phenomenon. Averaging them over different windows made
+    a sign law report chatter 0.99 alongside switch 0.86, which is impossible:
+    for bang-bang switching, switch = sqrt(chatter)."""
+    import csv as _csv
+    steps, tail = 10, 5
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"arms": {"paper": {"lam": 6.0, "k": 0.1, "store_corrected": True}},
+         "steps": steps, "w": [3.0], "seeds": [0], "prompts": ["p"]}), encoding="utf-8")
+    with (tmp_path / "signals.csv").open("w", newline="", encoding="utf-8") as fh:
+        wri = _csv.writer(fh)
+        wri.writerow(["arm", "w", "prompt_id", "seed", "step", "e_rms", "s_rms",
+                      "delta_rms", "chatter", "switch_activity", "deriv_matters", "k_eff"])
+        for step in range(steps):
+            # early steps quiet, tail steps fully switching
+            late = step > steps - 1 - tail
+            wri.writerow(["paper", 3.0, 0, 0, step, 0.05, 0.5, 0.1,
+                          1.0 if late else 0.0, 0.2 if late else 0.0, 0.02, 0.1])
+    res = signals.summarise(tmp_path, tail=tail)
+    key = ("paper", 3.0)
+    assert res["late_chat"][key].mean == pytest.approx(1.0)
+    # 0.2 / (2*0.1) == 1.0; averaging all ten steps would have given 0.5
+    assert res["switch"][key].mean / (2 * 0.1) == pytest.approx(1.0)
+    assert res["switch"][key].n == res["late_chat"][key].n
