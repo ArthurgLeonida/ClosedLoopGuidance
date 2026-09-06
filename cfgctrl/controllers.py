@@ -113,11 +113,11 @@ class StepInfo:
     """Batch-averaged diagnostics for one call of `correct`."""
     step: int
     e_rms: float            # rms of the measured error
-    s_rms: float            # rms of the sliding variable
+    s_rms: float            # surface before this call's correction/scheduler update
     delta_rms: float        # rms of the correction actually applied
     chatter: float          # fraction of elements whose sign(s) flipped since last step
     switch_activity: float  # rms(delta_t - delta_{t-1}): 2k per element for full chatter
-    deriv_matters: float    # fraction of elements where sign(s) != sign(e_prev)
+    deriv_matters: float    # strict sign disagreement with stored memory (zeros excluded)
     k_eff: float            # mean effective gain
 
 

@@ -1,5 +1,12 @@
 # CFG-Ctrl / SMC-CFG: what it really does, and how to improve it
 
+**Review update, 2026-09-06.** See [why the final surface is not zero](Signal_Interpretation.md)
+for the COCO results. The historical tables and the user's SD3.5 measurements
+are retained below. Earlier claims that measured memory guarantees convergence,
+that low derivative sign disagreement proves $s=\lambda e$, or that a small
+toy Jacobian implies no feedback were too strong. The
+[roadmap](Improvement_Roadmap.md) states current research hypotheses and limits.
+
 **A control-engineering review of** *CFG-Ctrl: Control-Based Classifier-Free
 Diffusion Guidance* (Wang, Liu, Chi, Liu, Xue, Duan; CVPR 2026 highlight;
 arXiv 2603.03281), **written for someone who studied control and wants the
@@ -7,10 +14,10 @@ concepts back.** Every concept the paper uses is re-derived in a grey
 "refresher" block the first time it appears, then applied to the paper.
 
 The code that goes with this document lives in `cfgctrl/` (see the README).
-Everything quantitative below comes from `experiments/toy_smc_cfg.py`, which
-runs on a CPU in a few minutes on a plant with ground truth. Nothing here was
-run on SD3.5 or Flux: there is no GPU on this machine. Where a claim is only a
-hypothesis about real models it is marked as such.
+The evidence tables contain historical toy runs and, in §3.2, the user's
+SD3.5 verification measurements. The new COCO analysis uses the supplied
+summary; the raw COCO run is not present in this local checkout. Structural
+diagnostics do not establish image-quality superiority of the refinements.
 
 ---
 
@@ -26,80 +33,28 @@ convergence of $s$ under two assumptions, and reports better FID / CLIP /
 human-preference numbers than CFG on SD3.5, Flux-dev and Qwen-Image at the
 default guidance scale of each model, plus much better robustness at large $w$.
 
-**What I found by implementing it and measuring it on an analytic plant.**
+**What the code and diagnostics support.**
 
-1. **The discrete sliding surface is essentially $\lambda e$.** With
-   $\lambda = 6$ and 30 steps, $s_t = e_t + (\lambda - 1)\,\hat e_{t-1}$ and
-   the derivative term decides the sign of $s$ in about 1–2 % of the elements.
-   SMC-CFG is, to first order, a **per-element sign-shrink of the guidance
-   vector**: $e \leftarrow e - k\,\mathrm{sign}(e)$. That also explains why
-   the paper's own $\lambda$ ablation is flat.
-2. **It chatters by construction and the chatter is self-inflicted.** The
-   authors store the *corrected* error as memory, so once $|e_i| < k$ the
-   surface becomes $s \approx (\lambda - 1)\,\Delta e_{\text{prev}}$ and the
-   sign alternates every step: the residual $\|s\|$ never goes to zero (it
-   sits at $(\lambda-1)k$), and 100 % of the elements flip sign in the last
-   ten steps. With $\lambda < 1$ (the authors' README default is 0.05) the same
-   mechanism *locks in a constant bias* of size $k$ instead.
-3. **The feedback loop the proof needs does not exist within a sampling
-   run.** The one-step gain from the correction to the next *measured* error
-   is $-\Delta\sigma\, w\, \partial e/\partial x$; measured along real
-   trajectories it is **negative** (more guidance makes the measured error
-   smaller, the paper's own premise) and **small** (median per-step authority
-   0.005–0.05, peaks near 0.3 for a few samples mid-trajectory, against
-   $k = 0.1$). Assumption 2 ($\Gamma \approx +wI$) never holds; the reaching
-   condition holds for 3–16 % of the (sample, step) pairs. The law works as
-   **open-loop shaping of the guidance direction**, not as a sliding mode, and
-   the switching direction the Lyapunov argument actually requires over-guides.
-4. **The sliding variable has relative degree zero** with respect to the
-   correction (the correction changes $\dot e$ instantly, so $s$ depends on it
-   algebraically). Textbook reaching-law analysis, and higher-order sliding
-   mode, assume relative degree one. A super-twisting controller on this $s$
-   settles into a two-step limit cycle of amplitude $k_1^2$ (unit-tested).
-5. **Where the method helps, it helps as an L1-type shrinkage of guidance**,
-   which lowers the effective guidance where the two branches nearly agree.
-   On the toy plant, at matched alignment, it is *strictly dominated* by CFG
-   at $w = 1$ (worse fidelity **and** worse alignment), roughly 1–9 % worse
-   for $w \le 2$, and 2–8 % better for $w \ge 3$ in 32-D (0–2 % in 2-D),
-   where the error vector is anisotropic. So most of the gain at a fixed $w$
-   is "a slightly smaller effective $w$"; a smaller part is genuine and grows
-   with the sparsity of $e$. The paper's Table 2 compares at one $w$ per model, which cannot
-   separate the two.
-6. **At $w = 1$ the law is not the conditional sampler.** The correction is
-   applied to $v_c = v_\varnothing + e$ itself, so with $k > 0$ the $w = 1$
-   sampler is biased toward the unconditional law (toy: fidelity 0.16 vs
-   0.10 for CFG, alignment below the true class law). Shrinking only the
-   extrapolation $(w - 1)\,e$ removes the bias exactly.
+1. The surface is $s_n=e_n+(\lambda-1)m_{n-1}$. Low strict sign disagreement
+   with stored memory does not establish $s_n\approx\lambda e_n$.
+2. Corrected memory and fixed sign switching can sustain alternation near
+   $(\lambda-1)k$ when successive measured errors are sufficiently small.
+   This is an alternating orbit, not a fixed point of the controller state.
+3. Measured memory removes the explicit previous-correction term, but still
+   uses both current and previous measured errors. Neither it nor saturation
+   guarantees zero surface at the last denoiser call.
+4. Feedback exists through the latent and future predictions. The old E4
+   diagnostic did not test the continuous theorem; see corrected §3.3.
+5. Extrapolation-only correction preserves ordinary CFG at $w=1$ and weakens the
+   correction at $w>1$, requiring a retuned paper baseline.
+6. Relative saturation must scale both gain and boundary width by RMS error.
+   That supports consistent units, not proven cross-model transfer.
 
-**What to do about it (ranked; each is developed in §4).**
-
-1. Replace $\mathrm{sign}(s)$ by $\mathrm{sat}(s/\phi)$ with $\phi = k\lambda$.
-   That is a classical boundary layer *and* it turns the law into exact
-   soft-thresholding of $e$ by $k$: identical results at the paper's $k$,
-   $\|s\| \to 0$ instead of a plateau, and a flat 0.03 of full chatter at
-   every $k$ instead of 0.39 rising to 0.83. Zero cost.
-2. Shrink the **extrapolation** $(w-1)\,e$, not the conditional prediction:
-   $\hat v = v_c + (w-1)(e + \Delta e)$. Exactly CFG at $w = 1$ for any $k$,
-   which the paper's law is not. On the toy it is the only law that never
-   falls more than 1.2 % below the CFG Pareto curve anywhere, and it keeps the
-   whole high-$w$ gain (E1).
-3. Store the **measured** error as memory, not the corrected one.
-4. Make $k$ **scale-free** (a fraction of $\mathrm{rms}(e)$) so one value
-   transfers across models (the paper needs 0.1 for SD3.5/Qwen and 0.7 for
-   Flux).
-5. Reframe the law as what it is (adaptive shrinkage) and then design it
-   properly: a **noise-adaptive threshold** (median absolute deviation of $e$)
-   is the estimation-theoretic version of the same idea.
-6. **Evaluate on Pareto curves over $w$ and across seeds**, log $\|e\|$,
-   $\|s\|$ and switching activity, and include the "null model" (CFG plus a
-   memoryless soft-threshold) as a baseline.
-
-Measured and discarded: a time-scaled sliding surface, super-twisting,
-adaptive gain, unit-vector switching and the flipped (Lyapunov-consistent)
-switching direction. None improved on the plain shrink on the Pareto curve, so
-none is in the implementation; the argument for each is kept where it matters
-in §3 and §4, and the code that measured them is in this repository's git
-history.
+**Candidates to compare.** Test individual refinements and their combination,
+ordinary CFG with tuned scales, and actual memoryless soft-thresholding.
+Compare paired fidelity/alignment tradeoffs with uncertainty. The
+[roadmap](Improvement_Roadmap.md) distinguishes implemented options from
+unimplemented hypotheses; none is established as universally superior.
 
 ---
 
@@ -286,8 +241,8 @@ Take $\lambda = 6$, $k = 0.1$.
   be $\approx 0$.
 * Same weak component with a boundary layer $\phi = k\lambda = 0.6$ (§4.1):
   $|s| = 0.35 < \phi$, so $\Delta e = -k \cdot s/\phi = -0.058$ and the applied
-  error is $-0.008 \approx 0$. That is soft-thresholding: everything below $k$
-  in magnitude is zeroed, everything above is shrunk by $k$.
+  error is $-0.008 \approx 0$. It is not exactly soft-thresholding: the current
+  surface still contains memory, and this component remains negative.
 
 ---
 
@@ -304,23 +259,15 @@ is far simpler than a text-to-image model; use it for the structural
 statements (signs, magnitudes, what a law reduces to), not for absolute
 quality claims.
 
-### 3.1 The surface is $\lambda e$; the law is a sign-shrink
+### 3.1 What the derivative statistic establishes
 
-$$s_t = (e_t - \hat e_{t-1}) + \lambda \hat e_{t-1} = e_t + (\lambda - 1)\,\hat e_{t-1}.$$
+The surface is $s_n=e_n+(\lambda-1)m_{n-1}$. If $m_{n-1}\approx e_n$,
+then $s_n\approx\lambda e_n$. The logged statistic does not test that premise:
+it counts strict sign disagreement with stored memory, excluding zeros.
 
-For consecutive steps $e_t \approx \hat e_{t-1}$, so $s_t \approx \lambda e_t$
-unless an element changes by more than $\lambda$ times its own value in one
-step. Measured on the toy plant at $\lambda = 6$: the derivative term decides
-$\mathrm{sign}(s)$ for about **1 % of the elements** averaged over a run (E2,
-E2). So
-
-$$e_{\text{applied}} \approx e - k\,\mathrm{sign}(e),$$
-
-a per-element sign-shrink of the guidance vector, and the "sliding mode" adds
-nothing visible over the memoryless map. This is consistent with the paper's
-own ablation, where $\lambda = 3, 4, 5, 6$ give FID 26.19, 26.01, 25.95, 26.14
-(Table 3): $\lambda$ barely matters because $s \approx \lambda e$ for any
-$\lambda \gg 1$, and only the sign of $s$ is used.
+For example, $m_{n-1}=1$, $e_n=-0.1$, $\lambda=6$ gives $s_n=4.9$:
+agreement with memory but opposition to the current error. Corrected memory
+can also leave a large surface when the measured error is small.
 
 ### 3.2 Chattering, and the corrected-error memory
 
@@ -331,15 +278,15 @@ dominated by the previous correction: $\mathrm{sign}(s_t) = \mathrm{sign}(\Delta
 $\Delta e_t = -\Delta e_{t-1}$. The correction alternates every step. Measured
 (E2): in the last ten steps **100 % of the elements flip** and the residual
 $\mathrm{rms}(s)$ plateaus at $(\lambda - 1)k = 0.5$ instead of going to zero.
-The sliding phase is never reached; what looks like "convergence onto the
-manifold" in Fig. 1 is the chattering band.
+The toy trajectory has a residual band. Figure 1 in the paper is explicitly
+schematic and cannot be read as measured convergence or chatter.
 
 Two corollaries.
 
 * **Store the measured error and the plateau disappears.** With measured
   memory the surface has no self-reference; with the boundary layer of §4.1
-  $\mathrm{rms}(s)$ falls to $\sim 10^{-3}$ (E2). This now also holds on a
-  trained model, by a factor of 4.5 rather than the toy's 50: see below.
+  $\mathrm{rms}(s)$ falls to about $0.010$ in E2. The trained-model observation
+  below shows a smaller reduction, about 4.5-fold; neither guarantees zero.
 * **With $\lambda < 1$ the same loop locks a bias.** The coefficient
   $(\lambda - 1)$ becomes negative, $\mathrm{sign}(s_t) = -\mathrm{sign}(\Delta e_{t-1})$,
   so $\Delta e_t = \Delta e_{t-1}$: whatever the correction was when $e$
@@ -376,24 +323,23 @@ Two predictions of this section hold quantitatively.
   Predicted $6 \times 0.0997 = 0.5982$; measured $0.5983$.
 * **Corrected memory pins $\lVert s\rVert$ at $(\lambda-1)k$** once
   $\lvert e\rvert \ll k$. Predicted $5 \times 0.1 = 0.500$; measured $0.5168$ at
-  30 steps and $0.5250$ at 8 steps, so it is a fixed point of the recurrence
-  rather than a step-count artefact. Over the run $\mathrm{rms}(e)$ fell
+  30 steps and $0.5250$ at 8 steps. Both are consistent with the small-error
+  alternating amplitude, not general step-count invariance. Over the run $\mathrm{rms}(e)$ fell
   $10.6\times$ while $\mathrm{rms}(s)$ fell $1.2\times$: the surface stops
   tracking the error and sits on the correction it made last step.
 
 Swapping to measured memory changes only the controller's own state, and the
 plateau goes: $\mathrm{rms}(s)$ is $4.5\times$ lower, chatter $3.7\times$ lower,
-and $\mathrm{rms}(s)$ now falls $5.3\times$ over the run, tracking the error as
-a sliding variable should. The derivative-decides index is unchanged at about
-2 %, confirming §3.1 on a real model too: with $\lambda = 6$ the surface is
-essentially $\lambda e$ either way.
+and $\mathrm{rms}(s)$ falls $5.3\times$ over the run. Its last value still
+contains the previous measured error: $s_n=e_n+5e_{n-1}$. The roughly 2%
+derivative statistic does not establish $s_n\approx6e_n$. The
+[COCO analysis](Signal_Interpretation.md) shows how to check the memory term.
 
 Three honest limits on this measurement. Chatter drops to 0.267, not to the
-toy's 0.00, because the trained model's own error changes sign between steps for
-about a quarter of the elements; only the self-inflicted part is removed.
+toy's 0.00: about a quarter of surface components change sign. This statistic
+alone does not identify the measured error's sign-flip rate.
 The final $\mathrm{rms}(e)$ is the same to 1.1 % across the two arms, which is
-consistent with the small loop gain of §3.3 but is a coarse summary and not
-proof of it. And **none of this is an image-quality result**: it measures the
+a coarse summary that cannot identify local feedback gain. And **none of this is an image-quality result**: it measures the
 controller's internal behaviour, not what the sampler produces.
 
 One further observation that the toy could not have produced, because it
@@ -406,102 +352,56 @@ than by the semantic error. That it does not visibly wreck the output is
 plausibly because the pattern alternates and consecutive Euler steps cancel
 much of it. It is a concrete argument for the scale-free gain of §4.4.
 
-### 3.3 The loop gain has the wrong sign and is negligible
+### 3.3 The actual discrete feedback response
 
-The correction $\Delta e_t$ changes the next latent by
-$-\Delta\sigma\, w\, \Delta e_t$ (Euler step), so it changes the next *measured*
-error by
+Feedback exists through changes in latent state and future model predictions.
+For an Euler step with $h=\sigma_n-\sigma_{n+1}>0$,
 
-$$\Delta e^{\text{meas}}_{t+1} \approx -\Delta\sigma\, w\, J\,\Delta e_t, \qquad J = \frac{\partial e}{\partial x}.$$
+$$x_{n+1}=x_n-h[v_u+w(e_n+\Delta e_n)],\qquad
+B_n=\frac{\partial e_{n+1}}{\partial\Delta e_n}=-hwJ_{n+1}.$$
 
-This is the paper's $\Gamma$ (Table 4: $\Gamma = w\nabla_x(v_c - v_\varnothing)$)
-with the sampling direction and the step size made explicit. The paper needs
-the symmetric part of $\Gamma$ to be positive and close to $wI$. Measured
-along trajectories with finite differences (E4):
+The Jacobian is evaluated at the resulting state and **next** noise level,
+holding the current state fixed during the intervention. Corrected memory adds
+$(\lambda-1)I$ to the next-surface sensitivity; measured memory does not.
 
-* the eigenvalues of $\mathrm{sym}(-J)$ are **negative** (down to about $-2$
-  around $\sigma \approx 0.8$, maximum $+0.04$) and go to zero late;
-* **Assumption 2 holds for 0 % of the (sample, step) pairs**;
-* the reaching condition $s^\top(-J)\,\mathrm{sign}(s) > 0$ holds for **3 %
-  (2-D) to 16 % (8-D)** of them, i.e. the paper's switching direction
-  *increases* $\|s\|$ most of the time;
-* the per-step loop gain $\Delta\sigma\, w\, \|J\|$ has median 0.05 (2-D) and
-  0.006 (8-D), with peaks near 0.3 for a few samples mid-trajectory, against
-  $k = 0.1$.
+The old E4 inspected $-J_n$ at the current state and mislabeled its outputs
+as assumption/reaching-condition tests. The updated experiment measures the
+next response and compares surface energy against a zero-current-correction
+counterfactual. These are local diagnostics, not continuous theorem checks.
 
-The sign is not an artefact of the toy. If guidance does its job, pushing
-harder toward the conditional manifold makes $v_c$ and $v_\varnothing$ agree
-*sooner*, so the measured error at the next step is *smaller*: $\partial e_{t+1}
-/ \partial \Delta e_t$ is negative along $e$. That is precisely the paper's own
-motivation in §3.2. So the Lyapunov argument, taken literally, requires the
-switching direction $+k\,\mathrm{sign}(s)$ (push harder when the error decays
-too slowly). Measured, that direction does what you would expect: it
-over-guides, with a higher Fréchet distance at every $w$ and a Pareto position
-above CFG's curve in 32-D. It is not in the implementation.
+Small per-step response does not eliminate accumulated feedback. A gain norm
+multiplies the correction and should not be compared directly with $k$ as if
+both were competing error amplitudes. Endpoint error norms do not identify
+the local gain.
 
-The magnitude is the second half of the story. With a median authority of
-$10^{-2}$ per step against a correction of $0.1$, the correction's effect on
-the *measured* error is typically one to two orders of magnitude smaller than
-the correction itself; it approaches $k$ only for a few samples around
-$\sigma \approx 0.8$, exactly where the eigenvalues are most negative, i.e.
-where the loop is most strongly *anti*-stabilising in the paper's sense.
-Over 30 steps the loop cannot move $s$ anywhere. What actually
-matters is the feed-through: the applied velocity is $v_\varnothing + w(e +
-\Delta e)$, and $\Delta e$ acts as **open-loop shaping of the guidance
-direction**, computed from a measurement but not closing a loop in any
-sense that a Lyapunov function would describe.
+### 3.4 Continuous and discrete surfaces require different analyses
 
-> **Refresher: loop gain and why it decides everything.** In a feedback loop
-> the *loop gain* is the product of all gains around the loop: how much a
-> change in the input comes back as a change in the measured error one trip
-> later. If it is $\ll 1$ per step, feedback is a metaphor: the controller's
-> output barely influences what it will measure next. If it is $O(1)$, the
-> loop can regulate, and also oscillate. In diffusion sampling the trip
-> includes a factor $\Delta\sigma \approx 1/30$ and a Jacobian of the
-> network, so the product is of order $10^{-2}$. Contrast a plant that
-> *integrates* its input — score distillation, where a persistent state is
-> optimised over thousands of iterations — where the accumulated effect of the
-> input on the measurement is of order one and the control vocabulary
-> (integral action, anti-windup, the sensitivity function) starts to earn its
-> keep. Sampling is not that plant.
+Writing $\dot e=a+wJ\Delta e$, with $a$ collecting correction-independent terms,
+gives $s=a+wJ\Delta e+\lambda e$. The surface already contains the input
+algebraically; differentiation generally introduces $wJ\Delta\dot e$ and other
+terms. Relating this to $\dot s=\Phi+\Gamma\Delta e$ needs justification.
 
-### 3.4 Relative degree
+A singular-value bound alone does not fix the control direction: $\Gamma=-I$
+is nonsingular but reverses $s^\top\Gamma\operatorname{sign}(s)$. The paper's
+supplementary directional assumption is stronger. These questions do not
+disprove its measured image-quality improvements.
 
-$s = \dot e + \lambda e$ and the correction changes $\dot e$ instantaneously
-($\dot e = J\dot x = J(v_\varnothing + w(e + \Delta e))$). So $s$ depends on
-$\Delta e$ *algebraically*: the relative degree of $s$ with respect to the
-input is zero. The paper's Eq. 23, $\dot s = \Phi_s + \Gamma_s \Delta e$,
-assumes relative degree one (the input drives the *derivative* of $s$).
-Differentiating the true $s$ would produce $\Delta \dot e$, the derivative of a
-discontinuous signal.
+**Refresher.** Relative degree counts derivatives before an input appears.
+A reaching law must match the actual input/output dynamics; adding higher-order
+control without identifying those dynamics is not a stability argument.
 
-> **Refresher: relative degree.** The number of times you must differentiate
-> the output before the input appears. Classical SMC wants $s$ of relative
-> degree one: then $u = -k\,\mathrm{sign}(s)$ drives $\dot s$ and finite-time
-> reaching follows. With relative degree zero the input sets $s$ directly;
-> the right tool is then an *equivalent control* $u_{eq}$ that solves
-> $s = 0$ algebraically, plus (in discrete time) a reaching law that
-> prescribes $s_{k+1}$ from $s_k$ (Gao et al.). Higher-order sliding mode
-> (super-twisting, Levant 1993) needs relative degree one and a Lipschitz
-> disturbance derivative; applied to a relative-degree-zero $s$ it produces
-> the two-cycle $|s_{t+1}| = k_1\sqrt{|s_t|} \Rightarrow |s| = k_1^2$, which is
-> exactly what was observed when it was tried here, so super-twisting is not
-> in the implementation.
+### 3.5 Lambda in the discrete recurrence
 
-### 3.5 Units: $\lambda$ has none, and the reference is unreachable
+The implemented difference is not divided by elapsed time. With measured
+memory, setting $s_n=0$ gives $e_n=(1-\lambda)e_{n-1}$. At $\lambda=6$
+this is $e_n=-5e_{n-1}$, not a decaying reference except at zero.
+The surface can still become small as both measurements shrink or cross zero
+at an isolated step.
 
-The finite difference $e_t - \hat e_{t-1} \approx \Delta\sigma\,\dot e$, so
-
-$$s_t \approx \Delta\sigma\Big(\dot e + \tfrac{\lambda}{\Delta\sigma}\, e\Big) = \tfrac{1}{30}\,(\dot e + 180\, e).$$
-
-The surface actually encoded is $\dot e = -180\,e$: a time constant of
-$1/180$ of the run, about a sixth of one step. No trajectory can follow that,
-which is another way of saying the sliding phase is unreachable and the law
-is a sign-shrink. It also means the paper's $\lambda = 6$ and the README's
-$\lambda = 0.05$ are not "the same surface at different speeds" but two
-different regimes (§3.2), and that $\lambda$ does not transfer across step
-count in any principled way — though it happens not to matter, because the
-derivative term is irrelevant either way.
+A residual $e_n-\exp(-\lambda h_n)e_{n-1}$ would encode exponential decay in
+elapsed progress $h_n>0$. It is another algorithm, requiring justified control
+authority and retuning. Lowering lambda merely to reduce the displayed surface
+does not establish better control or images.
 
 ### 3.6 Dimension: the $\sqrt D$ in Assumption 2
 
@@ -537,7 +437,7 @@ not the one I can run. Two mechanisms are consistent with everything above.
   estimator for a sparse signal in Gaussian noise (Donoho & Johnstone); the
   sign-shrink is its noisy cousin (it does not zero the small components, it
   flips them). If this is the mechanism, the boundary-layer version (§4.1)
-  should strictly dominate on real models, and the threshold should track the
+  is worth comparing on real models, and the threshold might track the
   noise level of $e$ (§4.5). On the toy plant, whose $e$ has no estimation
   noise, the two versions are indistinguishable at $k = 0.1$; at large $k$
   they diverge (E3): the sign law chatters and keeps pushing, the
@@ -561,8 +461,9 @@ not the one I can run. Two mechanisms are consistent with everything above.
 ## 4. Improvements
 
 Each entry: the idea, the equation, why it helps, what to expect, cost.
-"Toy" refers to the experiment in §5. All of them are implemented as flags of
-`cfgctrl.SMCConfig`; the paper is the all-flags-off configuration.
+"Toy" refers to the historical experiment in §5. Sections 4.1–4.4 describe
+existing flags of `cfgctrl.SMCConfig`; later sections include proposals.
+The default configuration reproduces the published discrete law.
 
 ### 4.1 Boundary layer = soft-threshold (do this first)
 
@@ -571,14 +472,15 @@ $$\Delta e = -k\,\mathrm{sat}(s/\phi), \qquad \mathrm{sat}(z) = \max(-1, \min(1,
 *Why.* This is the textbook chattering fix (Slotine & Li, *Applied Nonlinear
 Control*, §7.1): inside a layer of half-width $\phi$ around the surface the
 relay becomes a proportional term with gain $k/\phi$, so the input is
-continuous and the state settles in the layer instead of crossing it. Here it
-does more. Since $s \approx \lambda e$, inside the layer
+continuous. Whether the state remains in a layer depends on the plant and
+sampling; smoothing alone does not establish it. If $s \approx \lambda e$, inside the layer
 $\Delta e = -k\lambda e/\phi = -e$ when $\phi = k\lambda$, and
 
 $$e_{\text{applied}} = \mathrm{sign}(e)\,\max(|e| - k, 0),$$
 
-the soft-threshold (L1 proximal) operator, exactly. Small components are
-zeroed instead of flipped; large ones are shrunk by $k$ as before.
+the soft-threshold operator only when $s=\lambda e$, such as initialization
+or unchanged measured error with measured memory. In general it is an
+approximation; stale memory can still reverse small components.
 
 *Measured.* At $k = 0.1$ the boundary layer and the sign law are
 **indistinguishable on the Pareto curve** — the difference is 1 % or less,
@@ -591,16 +493,17 @@ switching activity is 0.03 of full chatter at *every* $k$ against 0.39 at
 $k = 0.02$ rising to 0.83 at $k = 1$ (E3). Those are the properties that
 matter once the correction is fed back to a network that will see it again at
 the next step. On
-real models this is the version to test first because it removes the only
-mechanism by which the law can *add* noise. Cost: none. Preset:
+real models this is a candidate to test for lower switching activity, without
+claiming it removes every source of noise. No extra denoiser call is needed. Preset:
 `presets.boundary_layer(lam, k)`.
 
 ### 4.2 Store the measured error
 
 `store_corrected=False`. Removes the self-referential loop of §3.2 in both its
 forms (alternation and lock-in). With the sign law alone this changes little
-(the sign-shrink still flips small elements), with the boundary layer it is
-what lets $s$ actually reach zero. Cost: none.
+(small components can still reverse). Neither option guarantees zero:
+$s_n=e_n+(\lambda-1)e_{n-1}$ still contains two measurements. No additional
+denoiser call is needed.
 
 ### 4.3 Shrink the extrapolation, not the conditional prediction
 
@@ -621,7 +524,7 @@ to know $w$. Flag: `excess_only=True`; preset `presets.boundary_layer_excess`.
 *Measured (E1).* Exactly CFG at $w = 1$; within 1 % of the CFG curve for
 $w \le 2$ where the paper's law is 2–10 % worse; 1–3 % (2-D) and 6–12 %
 (32-D) better than CFG for $w \ge 3$, i.e. the same high-$w$ gain as the
-paper's law. The only law here that is never worse than CFG.
+paper's law. These historical toy estimates do not establish universal dominance.
 
 ### 4.4 A scale-free gain
 
@@ -653,22 +556,16 @@ LPIPS on decoded images) rather than latent moments. Cost: one median per step,
 cheap next to a transformer forward pass. Not implemented; a few lines in
 `correct()`.
 
-### 4.6 Decide what the controller is for, then design for it
+### 4.6 Choose and test the objective
 
-The paper's control objective ("make $e$ decay like $\dot e = -\lambda e$")
-and the effect that produces good images ("attenuate guidance where the
-branches agree") are different objectives, and §3.3 shows they call for
-*opposite* switching directions. Two coherent options:
+Reducing prediction discrepancy is not identical to improving image quality
+or semantic alignment. Compare selective attenuation as an operator, with
+memoryless shrinkage and ordinary CFG at tuned scales. For explicit error
+tracking, derive a suitable discrete residual and measure its response.
 
-* **Keep the effect, drop the SMC story.** Present the method as adaptive
-  guidance shrinkage; design the threshold (4.1, 4.4, 4.5) and combine with
-  a direction operator (APG's projection removing the component parallel to
-  $v_c$) since shrinkage and projection address different failure modes
-  (noise vs oversaturation along the conditional direction).
-* **Keep the SMC story, fix the plant.** A real sliding mode needs a loop
-  gain of order one and relative degree one. Diffusion sampling has neither
-  (§3.3–3.4). A plant that integrates its input over a long horizon, such as
-  score distillation, would.
+Neither the toy nor the logs establish universally opposite switching
+directions, or that diffusion sampling cannot support feedback control.
+See the [roadmap](Improvement_Roadmap.md).
 
 ### 4.7 Evaluation protocol
 
@@ -685,22 +582,25 @@ branches agree") are different objectives, and §3.3 shows they call for
    **scale transfer** (fixed $k$ across models vs relative $k$).
 5. **Seed variance** of every metric. (This is your axis.)
 
-### 4.8 A relative-degree-correct redesign (higher effort)
+### 4.8 A discrete redesign is a separate research experiment
 
-If a real discrete-time sliding mode is wanted on the sampling plant, use a
-reaching law with an online gain estimate. Per element $i$, the one-step
-model is $s^{i}_{t+1} = c^{i}_t + g^{i}_t\,\Delta e^{i}_t$ with $g$ small and
-negative. Estimate $g^{i}$ by recursive least squares from consecutive
-$(\Delta e, s)$ pairs, then apply Gao's reaching law
-$s_{t+1} = (1 - q)\,s_t - \epsilon\,\mathrm{sign}(s_t)$ solved for $\Delta e_t$
-(an equivalent control plus switching). Expect the required $\Delta e$ to be
-enormous (dividing by a gain of $10^{-2}$) and therefore clipped: this is the
-quantitative form of "the loop cannot be closed in 30 steps". Worth doing once
-to make the point, not as a method.
+An inverse-gain reaching law needs an identified local response, including
+its sign, memory term and scheduler step. Weak or singular directions can
+require excessive corrections; clipping changes the assumed dynamics.
+Observational correlations alone do not identify causal authority.
+Use controlled perturbations and compute-matched comparisons before adding
+adaptive or higher-order control.
 
 ---
 
-## 5. Evidence from the analytic plant
+## 5. Historical evidence from the analytic plant
+
+The metric called Fréchet here is Gaussian moment Wasserstein-2 distance in toy
+state space: the square root of the squared FID expression, not image FID.
+The tables retain historical values. E4's invalid theorem interpretation is
+withdrawn. E5 predates relative boundary-width scaling and needs rerunning for
+current comparisons; changing target data with fixed noise is not a pure
+change of units.
 
 Setup: 8 Gaussian classes on a ring of radius 4 in $D = 2$ (std 1.5,
 neighbouring classes overlap, Bayes accuracy of the true class law well below
@@ -817,7 +717,8 @@ which is $2k$ — full chatter. Swapping the memory to the measured error alone
 collapses the plateau to 0.015 and the chatter to zero; the boundary layer
 takes $\mathrm{rms}(s)$ to 0.010. And the derivative term decides the sign of
 $s$ for only 2.1 % of elements (0.3 % once the memory is fixed), which is the
-measurement behind "the surface is essentially $\lambda e$".
+measurement of sign agreement with stored memory. It does not establish
+$s_n\approx\lambda e_n$, especially when memory contains the last correction.
 
 ### E3. The chattering regime: sign vs boundary layer as $k$ grows (`e3_k_sweep.png`)
 
@@ -844,24 +745,15 @@ not off it. At $k = 1$ the soft-threshold has zeroed most of $e$ and mean
 $p(c \mid x)$ has dropped from 0.971 to 0.704 — it is barely guiding any more.
 The unambiguous result here is the switching-activity row.
 
-### E4. The loop gain and the paper's Assumption 2 (`e4_loop_gain.png`)
+### E4. Discrete next-step response
 
-| plant | Assumption 2 holds | reaching condition holds (paper's sign) | median per-step gain $\Delta\sigma\,w\,\lVert J\rVert$ | max | eigenvalues of sym(-∂e/∂x) |
-|---|---|---|---|---|---|
-| ring2d | 0.0 % | 3.3 % | 0.0453 | 0.288 | [-1.73, 0.04] |
-| ring8d | 0.0 % | 16.2 % | 0.0057 | 0.361 | [-2.16, 0.04] |
-
-
-Reading. Assumption 2 never holds, on either plant. The paper's switching
-direction satisfies the reaching condition for 3 % (2-D) to 16 % (8-D) of the
-(sample, step) pairs, so the flipped direction is the one that would reduce
-$\lVert s \rVert$ for the large majority — and the eigenvalues of
-$\mathrm{sym}(-\partial e/\partial x)$ confirm it, running from $-2.16$ to
-$+0.04$ where Assumption 2 wants them near $+1$. Meanwhile the correction's
-authority over the next measured error has median 0.045 (2-D) and 0.006 (8-D)
-against $k = 0.1$, reaching $k$ only for a few samples near
-$\sigma \approx 0.8$. There is no loop here for a Lyapunov argument to
-describe.
+The former “Assumption 2 holds” and “reaching condition holds” counts were based
+on an inappropriate proxy and are withdrawn. The current experiment reports
+next-error sensitivity $-hwJ_{n+1}$, next-surface sensitivity
+$-hwJ_{n+1}+(\lambda-1)I$, and surface-energy changes relative to a counterfactual
+without the current correction. It excludes the terminal update, which has no
+subsequent controller evaluation. None of these is a continuous theorem test.
+See §3.3 and the current CSV fields.
 
 ### E5. Scale transfer (`e5_transfer.csv`)
 
@@ -942,8 +834,8 @@ inside, so the gain finds the disturbance bound by itself (Plestan et al.).
 trajectories; its decrease rate gives the convergence type (exponential for
 $\dot V \le -cV$, finite-time for $\dot V \le -\eta\sqrt V$).
 
-**Loop gain.** Product of gains around the loop; below 1 per step, feedback
-does little; near 1, it regulates and may oscillate.
+**Loop gain.** Local response around a feedback loop. Its magnitude, sign,
+time variation and accumulation matter; small response does not imply open-loop.
 
 **Sensitivity function.** $S = 1/(1 + L)$ with $L$ the loop gain; the factor
 by which feedback attenuates disturbances and reference errors. Your
@@ -961,8 +853,8 @@ repeat. Rectified-CFG++ is a one-step, no-optimisation instance.
 
 **Soft-thresholding.** $\mathrm{sign}(e)\max(|e| - k, 0)$: the estimator that
 minimises squared error plus an L1 penalty; zeroes small coefficients, shrinks
-large ones by $k$. SMC-CFG with a boundary layer $\phi = k\lambda$ is this
-operator applied to the guidance vector.
+large ones by $k$. The boundary-layer controller matches this map only
+when $s=\lambda e$; memory generally changes the operator.
 
 ---
 

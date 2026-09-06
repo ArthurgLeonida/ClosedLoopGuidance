@@ -14,6 +14,10 @@ Start with [possible improvements and why they could help](docs/Improvement_Road
 The [implementation review](docs/CFG-Ctrl_Review_and_Improvements.md) explains
 the controller, the toy evidence, and limits of the control-theory interpretation.
 
+For real-run diagnostics, read [why the last surface is not zero](docs/Signal_Interpretation.md).
+`python experiments/signals.py --run results/coco_test` now reports the previous
+measured error and the corresponding surface-norm bounds, using existing CSV rows.
+
 ## The controller
 
 For measured error `e = v_cond - v_uncond`, the published recurrence is:

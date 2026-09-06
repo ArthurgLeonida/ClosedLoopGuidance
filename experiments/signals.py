@@ -11,18 +11,20 @@ What it reports, per (arm, scale):
 
   rms(s) final    the sliding variable at the last step. For the paper's law,
                   which stores the CORRECTED error, this is predicted to sit at
-                  (lam-1)*k regardless of how small the measured error gets:
-                  once |e| < k the surface is dominated by the previous
-                  correction. An arm storing the MEASURED error has no such
-                  fixed point and should instead track the error down.
+                  approximately (lam-1)*k in the small-error alternating regime.
+                  An arm storing the MEASURED error instead has
+                  s_n = e_n + (lam-1)*e_(n-1); both measurements matter.
+                  This is the last denoiser call, before its scheduler update,
+                  not a measurement at the final decoded image.
   chatter         fraction of latent elements whose sign(s) flipped since the
                   previous step, averaged over the last few steps. Near 1.0
                   means essentially every element reverses every step.
-  switch activity rms(delta_t - delta_{t-1}) / 2k. 1.0 is full bang-bang
-                  reversal; a boundary layer should sit far below it.
-  derivative      fraction of elements where sign(s) != sign(e_prev), i.e. how
-                  often the derivative term in the sliding surface decides
-                  anything. Small means the surface is effectively lam*e.
+  switch activity rms(delta_t - delta_{t-1}) / (2*k*factor), where factor is
+                  (w-1)/w for excess-only correction, otherwise 1. This uses
+                  the arm's applied gain; relative-gain arms have no fixed norm.
+  derivative      fraction of strict sign disagreements between s and the
+                  stored memory. With corrected memory, this does not compare
+                  s with the current measured error.
 
 Only arms with k > 0 appear: a k = 0 arm never calls the controller, by design,
 so it writes no rows. That is why `cfg` is absent rather than empty.
@@ -75,30 +77,52 @@ class Running:
         return math.sqrt(max(var, 0.0))
 
 
-def predicted_plateau(arm_cfg: Dict) -> Optional[float]:
-    """(lam-1)*k, but only where the recurrence actually has that fixed point.
+def applied_gain(arm_cfg: Dict, w: Optional[float] = None) -> Optional[float]:
+    """Fixed error-correction amplitude, accounting for excess-only scaling."""
+    if arm_cfg.get("relative_gain", False):
+        return None
+    k = float(arm_cfg.get("k", 0.0))
+    if not math.isfinite(k) or k <= 0:
+        return None
+    if arm_cfg.get("excess_only", False):
+        if w is None or not math.isfinite(w) or w <= 1:
+            return None
+        k *= (w - 1) / w
+    return k
+
+
+def predicted_plateau(arm_cfg: Dict, w: Optional[float] = None) -> Optional[float]:
+    """Small-error alternating surface amplitude, not a fixed point or proof.
 
     It comes from feeding the previous correction back into the surface, so it
-    exists only when the corrected error is stored. With measured-error memory
-    the surface tracks e instead and has no plateau to predict.
+    This approximation requires corrected memory, sign switching, a fixed
+    positive gain and lam > 1. Smooth/relative laws need separate analysis.
     """
-    if not arm_cfg.get("store_corrected", True):
+    if (not arm_cfg.get("store_corrected", True)
+            or arm_cfg.get("switching", "sign") != "sign"):
         return None
-    lam, k = float(arm_cfg.get("lam", 0.0)), float(arm_cfg.get("k", 0.0))
-    return (lam - 1.0) * k if k > 0 and lam > 1 else None
+    lam, k = float(arm_cfg.get("lam", 0.0)), applied_gain(arm_cfg, w)
+    return (lam - 1.0) * k if k is not None and math.isfinite(lam) and lam > 1 else None
 
 
 def summarise(run: Path, tail: int = 5):
+    if tail <= 0:
+        raise ValueError("tail must be positive")
     cfg = json.loads((run / "config.json").read_text(encoding="utf-8"))
     arms: Dict[str, Dict] = cfg.get("arms", {})
     steps = int(cfg.get("steps", 0))
+    if steps <= 0:
+        raise ValueError("config.json must specify a positive number of steps")
     path = run / "signals.csv"
     if not path.is_file():
         raise ValueError(f"{path} not found")
 
     final_s, late_chat, deriv, switch, e_first, e_final = (defaultdict(Running) for _ in range(6))
     per_step: Dict[Tuple[str, float, int], Dict[str, Running]] = defaultdict(
-        lambda: {"s_rms": Running(), "chatter": Running()})
+        lambda: {"s_rms": Running(), "chatter": Running(), "e_rms": Running()})
+    # Keep only the last two measurements per trajectory. Pair by identity,
+    # not CSV adjacency, so interleaved/resumed runs do not mix prompts/seeds.
+    endpoints = defaultdict(dict)
     rows = 0
     max_step = 0
 
@@ -115,18 +139,24 @@ def summarise(run: Path, tail: int = 5):
             bucket = per_step[(arm, w, step)]
             bucket["s_rms"].add(s)
             bucket["chatter"].add(float(row["chatter"]))
+            bucket["e_rms"].add(float(row["e_rms"]))
             deriv[key].add(float(row["deriv_matters"]))
             if step == 0:
                 e_first[key].add(float(row["e_rms"]))
             last = steps - 1 if steps else None
+            if step in (last - 1, last):
+                trajectory = (arm, w, row["prompt_id"], row["seed"])
+                if step in endpoints[trajectory]:
+                    raise ValueError(f"duplicate endpoint row for {trajectory}, step {step}")
+                endpoints[trajectory][step] = (float(row["e_rms"]), s)
             if last is not None and step == last:
                 final_s[key].add(s)
                 e_final[key].add(float(row["e_rms"]))
             if last is not None and step > last - tail:
                 late_chat[key].add(float(row["chatter"]))
                 # Same window as chatter on purpose: they describe one
-                # phenomenon, and for a sign law switch should equal
-                # sqrt(chatter), which is only checkable if the windows match.
+                # phenomenon. For a fixed-amplitude sign law without zeros,
+                # the identity is per sample/step, before averaging sqrt(chatter).
                 switch[key].add(float(row["switch_activity"]))
 
     if not rows:
@@ -134,41 +164,68 @@ def summarise(run: Path, tail: int = 5):
     if steps and max_step != steps - 1:
         print(f"WARNING: config says {steps} steps but the highest step seen is "
               f"{max_step}; the 'final' column may not be the last step.\n")
+    measured = defaultdict(lambda: {name: Running() for name in
+                                   ("e_prev", "s", "lower", "upper")})
+    for (arm, w, _, _), values in endpoints.items():
+        cfgs = arms.get(arm, {})
+        if cfgs.get("store_corrected", True) or not all(s in values for s in (steps - 2, steps - 1)):
+            continue
+        prev = values[steps - 2][0]
+        current, surface = values[steps - 1]
+        coefficient = abs(float(cfgs.get("lam", 0.0)) - 1)
+        bucket = measured[(arm, w)]
+        for name, value in (("e_prev", prev), ("s", surface),
+                            ("lower", abs(coefficient * prev - current)),
+                            ("upper", coefficient * prev + current)):
+            bucket[name].add(value)
     return dict(arms=arms, steps=steps, rows=rows, final_s=final_s, late_chat=late_chat,
                 deriv=deriv, switch=switch, e_first=e_first, e_final=e_final,
-                per_step=per_step)
+                per_step=per_step, measured_memory=measured)
 
 
 def report(res: Dict, tail: int) -> None:
     arms, keys = res["arms"], sorted(res["final_s"])
     print(f"{res['rows']} rows, {res['steps']} steps\n")
-    print(f"{'arm':<10}{'w':>6}{'rms(e)':>17}{'rms(s) final':>16}{'predicted':>11}"
+    print(f"{'arm':<10}{'w':>6}{'rms(e)':>17}{'rms(s) last':>16}{'predicted':>11}"
           f"{'ratio':>8}{'chatter':>9}{'switch':>9}{'deriv':>8}")
     for key in keys:
         arm, w = key
         cfgs = arms.get(arm, {})
-        k = float(cfgs.get("k", 0.0)) or float("nan")
-        pred = predicted_plateau(cfgs)
+        gain = applied_gain(cfgs, w)
+        pred = predicted_plateau(cfgs, w)
         f = res["final_s"][key]
         e0, e1 = res["e_first"][key].mean, res["e_final"][key].mean
-        norm = res["switch"][key].mean / (2 * k) if k == k and k else float("nan")
-        pred_txt = f"{pred:.3f}" if pred else "tracks e"
+        norm = f"{res['switch'][key].mean / (2 * gain):.3f}" if gain else "--"
+        pred_txt = (f"{pred:.3f}" if pred else
+                    "tracks e" if not cfgs.get("store_corrected", True) else "n/a")
         ratio = f"{f.mean / pred:.2f}" if pred else "--"
         print(f"{arm:<10}{w:>6.2f}{e0:>8.4f}->{e1:<8.4f}"
               f"{f.mean:>9.4f} ±{f.sd:.3f}{pred_txt:>11}{ratio:>8}"
-              f"{res['late_chat'][key].mean:>9.3f}{norm:>9.3f}"
+              f"{res['late_chat'][key].mean:>9.3f}{norm:>9}"
               f"{res['deriv'][key].mean * 100:>7.1f}%")
 
-    print(f"\n  rms(e) is the measured error, first step -> last.")
-    print(f"  'predicted' is (lam-1)*k, the fixed point that corrected-error memory")
-    print(f"  creates once |e| < k. 'ratio' near 1.00 confirms it. Arms storing the")
-    print(f"  measured error have no such fixed point and should track e down instead.")
+    print("\n  'last' is the last denoiser evaluation, before its scheduler update.")
+    print("  'predicted' is a small-error alternating amplitude for corrected-memory")
+    print("  sign switching with a fixed gain. A ratio near 1 is consistent with it.")
+    print("  'tracks e' means s_n = e_n + (lam-1)*e_(n-1), not s_n = lam*e_n")
+    print("  or a guarantee of zero at the last step.")
     print(f"  chatter and switch both average the last {tail} steps; switch is")
-    print(f"  normalised by 2k, so 1.0 is full reversal every step. For a sign law")
-    print(f"  switch should equal sqrt(chatter); a mismatch means the correction is")
-    print(f"  not bang-bang. 'deriv' is averaged over the whole run.")
+    print("  normalised by twice the applied fixed gain (including (w-1)/w for excess).")
+    print("  For fixed sign switching without zeros, per-sample switch = sqrt(chatter).")
+    print("  Averages need not obey that equality. Relative-gain normalisation is omitted.")
+    print("  'deriv' counts strict sign disagreement with stored memory over the whole")
+    print("  run; low values do not imply agreement with the current measured error.")
     print(f"  These are controller diagnostics only: they say nothing about image")
     print(f"  quality. Use evaluate.py and pareto.py for that.")
+    if res["measured_memory"]:
+        print("\n  Measured-memory check, paired last two calls (mean RMS bounds):")
+        print(f"  {'arm':<10}{'w':>6}{'pairs':>8}{'rms(e_prev)':>14}{'s lower':>12}{'observed s':>12}{'s upper':>12}")
+        for (arm, w), b in sorted(res["measured_memory"].items()):
+            print(f"  {arm:<10}{w:>6.2f}{b['s'].n:>8}{b['e_prev'].mean:>14.4f}"
+                  f"{b['lower'].mean:>12.4f}{b['s'].mean:>12.4f}{b['upper'].mean:>12.4f}")
+        print("  Bounds: abs(|lam-1|*rms(e_prev)-rms(e)) <= rms(s)")
+        print("          <= |lam-1|*rms(e_prev)+rms(e), averaged over paired trajectories.")
+        print("  Bounds constrain the norm; scalar RMS logs cannot reconstruct direction.")
 
 
 def write_csv(run: Path, res: Dict) -> Path:
@@ -177,12 +234,16 @@ def write_csv(run: Path, res: Dict) -> Path:
         wri = csv.writer(fh)
         wri.writerow(["arm", "w", "n_final", "e_rms_first", "e_rms_final", "s_rms_final",
                       "s_rms_final_sd", "predicted_plateau", "ratio", "chatter_late",
-                      "switch_activity_norm", "deriv_matters"])
+                      "switch_activity_norm", "deriv_matters", "switch_activity_applied_norm",
+                      "n_paired", "e_rms_prev_final", "s_rms_paired_final",
+                      "s_rms_lower_bound", "s_rms_upper_bound"])
         for key in sorted(res["final_s"]):
             arm, w = key
             cfgs = res["arms"].get(arm, {})
             k = float(cfgs.get("k", 0.0))
-            pred = predicted_plateau(cfgs)
+            pred = predicted_plateau(cfgs, w)
+            gain = applied_gain(cfgs, w)
+            b = res["measured_memory"].get(key)
             f = res["final_s"][key]
             wri.writerow([arm, w, f.n, f"{res['e_first'][key].mean:.6f}",
                           f"{res['e_final'][key].mean:.6f}", f"{f.mean:.6f}",
@@ -190,7 +251,11 @@ def write_csv(run: Path, res: Dict) -> Path:
                           "" if pred is None else f"{f.mean / pred:.6f}",
                           f"{res['late_chat'][key].mean:.6f}",
                           f"{res['switch'][key].mean / (2 * k):.6f}" if k else "",
-                          f"{res['deriv'][key].mean:.6f}"])
+                          f"{res['deriv'][key].mean:.6f}",
+                          f"{res['switch'][key].mean / (2 * gain):.6f}" if gain else "",
+                          b["s"].n if b else 0,
+                          *([f"{b[name].mean:.6f}" for name in ("e_prev", "s", "lower", "upper")]
+                            if b else [""] * 4)])
     return out
 
 
@@ -210,8 +275,8 @@ def plot(run: Path, res: Dict) -> Optional[Path]:
         return None
     fig, axes = plt.subplots(2, len(arms), figsize=(5.5 * len(arms), 7), squeeze=False)
     for col, arm in enumerate(arms):
-        pred = predicted_plateau(res["arms"].get(arm, {}))
         for i, w in enumerate(scales):
+            pred = predicted_plateau(res["arms"].get(arm, {}), w)
             steps = sorted(s for a, ww, s in res["per_step"] if a == arm and ww == w)
             if not steps:
                 continue
@@ -219,9 +284,14 @@ def plot(run: Path, res: Dict) -> Optional[Path]:
                 axes[row][col].plot(
                     steps, [res["per_step"][(arm, w, s)][metric].mean for s in steps],
                     color=colors[i % len(colors)], linewidth=1.6, label=f"w={w:g}")
-        if pred:
-            axes[0][col].axhline(pred, color="#52514e", linestyle="--", linewidth=1.2,
-                                 label=f"(lam-1)k = {pred:.2f}")
+            if pred:
+                axes[0][col].axhline(pred, color=colors[i % len(colors)], linestyle="--",
+                                    linewidth=0.9, label=f"limit w={w:g}: {pred:.2f}")
+            elif not res["arms"].get(arm, {}).get("store_corrected", True):
+                lam = float(res["arms"][arm].get("lam", 0.0))
+                axes[0][col].plot(steps, [lam * res["per_step"][(arm, w, s)]["e_rms"].mean
+                                        for s in steps], color=colors[i % len(colors)],
+                                 linestyle=":", linewidth=1.0, label=f"lam*rms(e), w={w:g} (approx.)")
         axes[0][col].set_title(f"{arm}: sliding variable", loc="left", fontsize=10)
         axes[1][col].set_title(f"{arm}: chatter", loc="left", fontsize=10)
         for row in (0, 1):
