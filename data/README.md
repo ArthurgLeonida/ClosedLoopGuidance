@@ -9,6 +9,10 @@ Download the **2017 validation images** and **2017 train/validation annotations*
 - `captions_val2017.json` to `data/annotations/`.
 - The 5,000 validation JPEGs to `data/reference/val2017/`.
 
+The [nohup download command](../docs/Running_Benchmarks.md#1-prepare-annotations-and-the-aesthetic-head)
+downloads and extracts both archives into these paths. The preparation command
+below requires the annotation file to exist already.
+
 ~~~bash
 python -m cfgctrl.benchmark prepare coco --annotations data/annotations/captions_val2017.json
 ~~~

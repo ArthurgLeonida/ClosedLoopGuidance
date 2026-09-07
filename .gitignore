@@ -27,6 +27,7 @@ git/
 # Prepared manifests are embedded in each saved run plan.
 data/reference/
 data/annotations/
+data/downloads/
 data/benchmarks/
 data/weights/
 external/

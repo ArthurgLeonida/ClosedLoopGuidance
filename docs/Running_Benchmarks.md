@@ -6,6 +6,29 @@ Before the full run, install the generation and evaluator environments and confi
 
 ## 1. Prepare annotations and the aesthetic head
 
+If `data/annotations/captions_val2017.json` or the COCO reference images are missing,
+download and extract the official archives first. `prepare coco` reads an existing
+annotation file; it does not download the dataset.
+
+~~~bash
+nohup bash -c '
+  set -e
+  command -v wget >/dev/null
+  command -v unzip >/dev/null
+  mkdir -p data/downloads data/annotations data/reference
+  wget -c -P data/downloads http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+  unzip -n data/downloads/annotations_trainval2017.zip annotations/captions_val2017.json -d data
+  wget -c -P data/downloads http://images.cocodataset.org/zips/val2017.zip
+  unzip -n data/downloads/val2017.zip -d data/reference
+  test -s data/annotations/captions_val2017.json
+  echo COCO_DOWNLOAD_COMPLETE
+' > coco_download.nohup.log 2>&1 &
+~~~
+
+Wait for `COCO_DOWNLOAD_COMPLETE` in that log before continuing. Downloads resume
+with `wget -c`; extraction keeps existing files. The URLs come from the
+[official COCO download page](https://cocodataset.org/#download).
+
 Run once, if the manifests/weight are not prepared yet:
 
 ~~~bash
