@@ -37,6 +37,7 @@ if [ ! -w "$CLG_PERSIST" ]; then
 fi
 
 export HF_HOME="$CLG_PERSIST/hf"
+export TORCH_HOME="${TORCH_HOME:-$CLG_PERSIST/torch}"
 export CONDA_PKGS_DIRS="$CLG_PERSIST/conda/pkgs"
 export PIP_CACHE_DIR="$CLG_PERSIST/pip-cache"
 mkdir -p "$HF_HOME" "$CONDA_PKGS_DIRS" "$PIP_CACHE_DIR" "$(dirname "$CLG_ENV")" || return 1

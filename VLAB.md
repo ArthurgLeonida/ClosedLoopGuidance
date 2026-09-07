@@ -73,11 +73,30 @@ Create `clg-mps` first, as with the metrics environment. These inference require
 ## T2I-CompBench
 
 ~~~bash
-git clone https://github.com/Karine-Huang/T2I-CompBench.git external/T2I-CompBench
-git -C external/T2I-CompBench checkout 4aa404212eb5d06e5adbcd9cee696c750d0d25a5
+nohup bash -c '
+  set -e
+  test -d external/T2I-CompBench ||
+    git clone https://github.com/Karine-Huang/T2I-CompBench.git external/T2I-CompBench
+  git -C external/T2I-CompBench checkout 4aa404212eb5d06e5adbcd9cee696c750d0d25a5
+' > compbench_source.nohup.log 2>&1 &
 ~~~
 
-Follow that revision's [official installation instructions](https://github.com/Karine-Huang/T2I-CompBench/blob/4aa404212eb5d06e5adbcd9cee696c750d0d25a5/Readme.md) in a separate environment. Both BLIP-VQA attribute scoring and UniDet spatial scoring are needed, including their checkpoint files, Detectron2 build and spaCy model. The upstream dependency setup is not replaced by the general metrics requirements.
+For the H100 host with the CUDA 12.4 toolkit and GCC 11, after the source checkout completes:
+
+~~~bash
+nohup bash -c '
+  set -e
+  export CLG_ENV=/home/jovyan/compartilhado/envs/clg-generation
+  source ./vlab_env.sh
+  export CUDA_HOME=/usr/local/cuda-12.4
+  export CUDA_VISIBLE_DEVICES=0
+  bash scripts/setup_compbench.sh
+' > compbench_setup.nohup.log 2>&1 &
+~~~
+
+The installer creates `clg-compbench` under `$CLG_PERSIST/envs`, installs inference dependencies, and compiles the upstream-pinned Detectron2 revision for H100 (SM 9.0). It uses the [official PyTorch 2.5.1/torchvision 0.20.1 CUDA 12.4 pairing](https://pytorch.org/get-started/previous-versions/), matching the local compiler as required by [Detectron2](https://detectron2.readthedocs.io/en/latest/tutorials/install.html). This is an adapted inference environment, not the upstream frozen CUDA 11 training environment. Other hardware requires reviewing these defaults.
+
+Setup downloads UniDet's required detection checkpoint from the Prismer author's repository. Official BLIP inference downloads its checkpoint and BERT tokenizer on first use. It then exercises a compiled CUDA kernel and the official BLIP-VQA and UniDet scripts on bundled examples. Only successful inference with complete, finite scores prints `COMPBENCH_SETUP_COMPLETE`. Logs, package versions and diagnostic scores are retained under `results/compbench_setup/`; these scores are not benchmark results. If inference fails, inspect the newest `smoke_*/{color,spatial}/inference.log`. This setup requires validation on the target GPU host; local CPU tests do not establish CUDA compatibility.
 
 Set `evaluation.scorers.compbench.python` to that environment's interpreter. The pipeline stages the exact prompt-based filenames, invokes `BLIP_vqa.py` for color/shape/texture and `2D_spatial_eval.py` for spatial relations, and verifies complete result coverage. It preserves finished categories when a later category fails.
 

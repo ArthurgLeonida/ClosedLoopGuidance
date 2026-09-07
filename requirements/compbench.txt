@@ -1,0 +1,22 @@
+# Inference dependencies for the pinned official CompBench evaluator.
+# Torch/CUDA and Detectron2 are installed by scripts/setup_compbench.sh.
+numpy==1.26.4
+Pillow==9.5.0
+transformers==4.30.2
+huggingface-hub==0.36.2
+accelerate==0.17.0
+timm==0.6.13
+fairscale==0.4.4
+ruamel.yaml==0.17.32
+spacy==3.5.3
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.5.0/en_core_web_sm-3.5.0-py3-none-any.whl#sha256=0964370218b7e1672a30ac50d72cdc6b16f7c867496f1d60925691188f4d2510
+opencv-python-headless==4.7.0.72
+scipy==1.11.4
+pycocotools==2.0.7
+fvcore==0.1.5.post20221221
+iopath==0.1.9
+omegaconf==2.3.0
+hydra-core==1.3.2
+matplotlib==3.7.1
+yacs==0.1.8
+tabulate==0.9.0

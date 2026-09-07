@@ -4,6 +4,8 @@ Run these commands from the repository root on the Linux GPU machine. They sourc
 
 Before the full run, install the generation and evaluator environments and configure their Python paths as described in [VLAB.md](../VLAB.md). COCO JPEGs and caption annotations must already be extracted to the paths in [data/README.md](../data/README.md). MPS and CompBench need their official source repositories and weights. The full workflow checks these prerequisites before generating images.
 
+For the H100/CUDA 12.4 host, [the CompBench setup command](../VLAB.md#t2i-compbench) creates its dedicated environment and runs both official inference backends. Wait for `COMPBENCH_SETUP_COMPLETE` before launching the full workflow; doctor alone does not test model inference.
+
 ## 1. Prepare annotations and the aesthetic head
 
 If `data/annotations/captions_val2017.json` or the COCO reference images are missing,

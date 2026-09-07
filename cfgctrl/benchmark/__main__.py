@@ -74,7 +74,8 @@ def doctor(config_path, device):
     for interpreter, metrics in environments.items():
         modules = {packages[m] for m in metrics if m in packages} | {"torch", "torchvision", "PIL"}
         if "compbench" in metrics:
-            modules |= {"spacy", "detectron2"}
+            modules |= {"spacy", "en_core_web_sm", "detectron2", "transformers",
+                        "timm", "fairscale", "ruamel", "cv2", "accelerate"}
         if "mps" in metrics:
             modules.add("einops")
         check = ("import importlib.util, importlib.metadata as md, json\n"
