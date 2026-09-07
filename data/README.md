@@ -1,64 +1,56 @@
-# Data
+# Benchmark data
 
-Nothing here is training data — nothing in this repository is trained. A
-text-to-image sampler takes a prompt and seeded noise, so what you supply is
-**prompts**. Real images are needed for exactly one thing: the reference
-distribution that FID compares against.
+Run all commands from the repository root. Large data, downloaded annotations and weights are ignored by Git. Keep the frozen JSON manifests with the corresponding experiment; `plan.json` embeds their complete contents.
 
-## Layout
+## COCO
 
-```
-data/
-    prompts/                    committed: these define the experiment
-        coco_val2017.txt        one caption per image, all 5,000
-        tune.txt                for choosing w and k, never reported
-        test.txt                for the reported comparison, disjoint from tune
-        coco_val2017_pairs.csv  image_id, file_name, caption
-    reference/                  gitignored: large, and not ours to redistribute
-        captions_val2017.json   the COCO annotation file
-        val2017/                the 5,000 real images, for FID only
-```
+Download the **2017 validation images** and **2017 train/validation annotations** from the [official COCO download page](https://cocodataset.org/#download). Extract:
 
-## Why COCO val2017
+- `captions_val2017.json` to `data/annotations/`.
+- The 5,000 validation JPEGs to `data/reference/val2017/`.
 
-The paper evaluates on "a subset of the MS-COCO dataset, comprising 5,000
-image-text pairs". `val2017` is exactly 5,000 images with about five captions
-each, so it supplies both halves: captions to generate from, images to measure
-FID against.
+~~~bash
+python -m cfgctrl.benchmark prepare coco --annotations data/annotations/captions_val2017.json
+~~~
 
-## Getting it
+The default selects 5,000 distinct image identities and one caption per image with selection seed 0. Caption choice, image IDs and source hashes are frozen in `data/benchmarks/coco.json`. The reference set for FID is exactly those image identities; unrelated files in the reference folder are excluded.
 
-```bash
-mkdir -p data/reference
+The paper does not release its exact pairs or specify the COCO split sufficiently to recover them. Val2017 and the seeded caption choice are this repository's declared choices. If the original pairs become available, provide a JSON list:
 
-# captions (~250 MB zipped, one JSON extracted)
-curl -L -o data/reference/ann.zip \
-    http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-unzip -j data/reference/ann.zip 'annotations/captions_val2017.json' -d data/reference/
+~~~json
+[
+  {"image_id": 139, "caption_id": 123456}
+]
+~~~
 
-# the prompt files
-python data/prepare_prompts.py --captions data/reference/captions_val2017.json
+The IDs above illustrate the format; use real matching IDs from your annotation file. Pass `--pairs path/to/pairs.json --count 5000`. The preparation command rejects repeated images and captions assigned to another image. Use a separate manifest and output directory for a smaller smoke test.
 
-# images, only if you will compute FID (~780 MB)
-curl -L -o data/reference/val2017.zip http://images.cocodataset.org/zips/val2017.zip
-unzip -q data/reference/val2017.zip -d data/reference/
-```
+## T2I-CompBench
 
-`prepare_prompts.py` takes one caption per image, choosing the lowest
-annotation id so the set is reproducible from the annotation file alone, and
-splits a seeded shuffle into disjoint `tune` and `test`. The split is
-deliberate: §5.2 of the improvement roadmap requires tuning and reporting on
-different prompts, and tuning on the reported set would invalidate the
-comparison.
+~~~bash
+python -m cfgctrl.benchmark prepare compbench --download
+~~~
 
-## How many prompts
+This downloads the four official validation prompt files at revision `4aa404212eb5d06e5adbcd9cee696c750d0d25a5` of [T2I-CompBench](https://github.com/Karine-Huang/T2I-CompBench). Each contains 300 prompts; the combined manifest contains 1,200. Alternatively, prepare from a local checkout with `--repo external/T2I-CompBench`.
 
-`experiments/evaluate.py clip` prints `need ~N prompts` from the spread it
-observes. On the first SD3.5 pilot that came to roughly 200 to resolve the CLIP
-gain the paper reports for SD3.5 (0.3681 → 0.3694 raw cosine). The defaults
-here — 250 tune, 1,000 test — leave headroom above that. Prompts, not seeds,
-are what narrow the interval: the bootstrap resamples prompts, so they are the
-independent unit.
+Generation does not need the evaluator installed. Scoring needs the official BLIP-VQA/UniDet environments and weights described in [VLAB.md](../VLAB.md). Prompt files alone do not provide these assets.
 
-FID is separate and needs thousands of images regardless; on a few hundred it
-is dominated by sample-size bias.
+## GenAI-Bench
+
+~~~bash
+python -m cfgctrl.benchmark prepare genai --download
+~~~
+
+The command downloads only the prompt and skill JSONs from [BaiqiL/GenAI-Bench-1600](https://huggingface.co/datasets/BaiqiL/GenAI-Bench-1600). It does not download the benchmark's example model images. Use `--revision COMMIT` to pin the upstream revision. Local files can instead be supplied with `--prompts image.json --skills genai_skills.json`.
+
+The released 1,600 prompts include 722 Basic, 871 Advanced and seven untagged prompts. Generate and score all 1,600; the official Overall aggregation uses the union of skill tags, hence 1,593 prompts. The separate GenAI-Bench-527 prompt/skill files are also accepted when supplied explicitly, but the default protocol uses 1,600.
+
+## Evaluation weights
+
+~~~bash
+python -m cfgctrl.benchmark prepare aesthetic
+~~~
+
+This obtains the official `sac+logos+ava1-l14-linearMSE.pth` predictor. Most other scoring checkpoints download through their official loaders on first evaluation. MPS and CompBench need manual setup; see [VLAB.md](../VLAB.md).
+
+Do not tune controller gains on the final reporting prompts. Keep a separate tuning manifest and use the frozen benchmark configuration for the reported comparison.

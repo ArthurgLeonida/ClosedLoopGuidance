@@ -1,0 +1,16 @@
+# Separate Python 3.11 environment; install matched torch/torchvision first.
+transformers==4.44.2
+huggingface-hub>=0.34,<1
+diffusers==0.30.3
+accelerate>=0.34,<1
+numpy==1.26.4
+pillow>=10
+clean-fid==0.1.35
+openai-clip==1.0.1
+open-clip-torch==2.23.0
+hpsv2==1.2.0
+image-reward==1.5
+timm==0.6.13
+# Official image-era CLIP-FlanT5 implementation, without the v3 video stack.
+t2v-metrics==1.1
+protobuf>=3.20,<4

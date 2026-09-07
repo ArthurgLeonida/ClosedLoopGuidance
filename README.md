@@ -1,185 +1,93 @@
-# CFG-Ctrl, reimplemented and measured
+# CFG-Ctrl: generation and paper benchmarks
 
-A control-engineering study of **CFG-Ctrl: Control-Based Classifier-Free Diffusion
-Guidance**, Wang et al., CVPR 2026. [Paper](https://arxiv.org/abs/2603.03281),
-[authors' code](https://github.com/THU-SI/CFG-Ctrl).
+Compare the published controller with ordinary CFG and the implemented chattering fixes on SD3.5-Large, FLUX.1-dev and Qwen-Image. One configuration selects the models, controller arms, scales, benchmarks and seeds.
 
-This repository reproduces the published discrete controller, studies it on an
-analytic Gaussian-mixture flow, and provides a hook for doubled-batch CFG
-pipelines. CPU tests and toy experiments validate the local implementation.
-**The proposed variants have not been shown to produce better images than the
-paper on trained models.**
+| Benchmark | Evaluation |
+|---|---|
+| COCO, 5,000 frozen image-caption pairs | FID, CLIP, Aesthetic, ImageReward, PickScore, HPSv2, HPSv2.1, MPS |
+| T2I-CompBench validation | Official color, shape, texture and 2D spatial evaluators |
+| GenAI-Bench, 1,600 prompts | VQAScore: Basic, Advanced and Overall |
 
-Start with [possible improvements and why they could help](docs/Improvement_Roadmap.md).
-The [implementation review](docs/CFG-Ctrl_Review_and_Improvements.md) explains
-the controller, the toy evidence, and limits of the control-theory interpretation.
+These are the benchmark and metric families in [CFG-Ctrl](https://arxiv.org/html/2603.03281v2). The released paper does not identify its exact COCO pairs or every evaluation setting. This repository declares a reproducible local protocol; its results are not a claim of exact table reproduction. See [benchmark settings and limitations](docs/Benchmark_Protocol.md).
 
-Em português: [os controles usados no artigo e neste repositório](docs/Controles_Explicados_ptBR.md)
-maps every control concept to the paper's notation and says which ones are the
-paper's and which are this repository's options.
+## Setup
 
-For real-run diagnostics, read [why the last surface is not zero](docs/Signal_Interpretation.md).
-`python experiments/signals.py --run results/coco_test` now reports the previous
-measured error and the corresponding surface-norm bounds, using existing CSV rows.
-
-The [ranked chattering fixes](docs/Chattering_Fixes.md) explain the new
-`proximal` and `proximal_relative` arms and their fresh toy results. Both
-soft-threshold the current CFG extrapolation without temporal control memory.
-They produce zero correction at zero error and cannot reverse a guidance
-component; better image quality still needs a trained-model comparison.
-
-## The controller
-
-For measured error `e = v_cond - v_uncond`, the published recurrence is:
-
-~~~text
-prev = e                                # initialization only
-s = (e - prev) + lam * prev
-delta = -k * sign(s)
-v_hat = v_uncond + w * (e + delta)
-prev = e + delta                        # corrected memory
-~~~
-
-The default parameters reproduce the paper's SD3.5/Qwen settings:
-`lam=6`, `k=0.1`. The float32 reference test replays the authors' recurrence.
-`k=0` is an exact no-op on the error.
-
-The implemented refinements are independent options:
-
-| Option | Motivation | Limit |
-|---|---|---|
-| `store_corrected=False` | Remove the previous correction from the next surface calculation. | Model measurements can still oscillate. |
-| `switching="sat"` | Smooth abrupt switching near zero. | Exact soft-thresholding only when `s=lam*e`; memory can still reverse small components. |
-| `excess_only=True` | Correct only the extrapolation beyond conditional prediction; preserve CFG at `w=1`. | Its weaker correction needs comparison with a retuned paper baseline. |
-| `relative_gain=True` | Scale gain and saturation width by each sample's RMS error. | Consistent units do not guarantee cross-model transfer. |
-
-The toy diagnostics show a specific memory-induced switching mechanism. They
-do not certify or refute the paper's continuous theorem on neural models.
-The toy fidelity metric is Gaussian moment Wasserstein-2 distance
-(square root of the squared FID expression), not image FID.
-
-## Setup and CPU checks
-
-`cfgctrl/` needs PyTorch. Tests also need pytest; plots need matplotlib.
-Choose a Python environment, then install the CPU track:
+Use Python 3.11 and a matching GPU build of PyTorch and torchvision, then:
 
 ~~~bash
-python -m pip install torch matplotlib pytest
-python -m pytest tests/ -q
-python experiments/toy_smc_cfg.py --quick --out results/quick
-python experiments/toy_smc_cfg.py --out results/toy
+python -m pip install -r requirements/generation.txt
 ~~~
 
-For a virtual environment:
+Generation and the older evaluation packages use separate environments. Follow [VLAB.md](VLAB.md) for the evaluator environments, official checkpoints, persistent caches and background runs. The CPU controller tests only need `requirements.txt`.
+
+Prepare the data once, from the repository root:
 
 ~~~bash
-python -m venv .venv
-# Linux/macOS:
-source .venv/bin/activate
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
+python -m cfgctrl.benchmark prepare coco --annotations data/annotations/captions_val2017.json
+python -m cfgctrl.benchmark prepare compbench --download
+python -m cfgctrl.benchmark prepare genai --download
+python -m cfgctrl.benchmark prepare aesthetic
 ~~~
 
-For the full dependency set, use `python -m pip install -r requirements.txt`,
-or `conda env create -f environment.yml` followed by `conda activate clg`.
-Select and verify a suitable PyTorch GPU build using [VLAB.md](VLAB.md)
-before running a trained model.
+Place COCO validation images in `data/reference/val2017`. [Data instructions](data/README.md) explain downloads, explicit image-caption pairs and the frozen manifests. CompBench preparation downloads prompts only; evaluation also needs its official code and weights.
 
-If an existing pytest cache is inaccessible, use
-`python -m pytest tests/ -q -p no:cacheprovider`.
-Outputs are ignored by Git. Use separate output directories for comparisons;
-partial toy runs retain per-experiment configuration metadata.
+## Select and run
 
-## Use
-
-~~~python
-from cfgctrl import SlidingModeGuidance, presets
-
-ctrl = SlidingModeGuidance(presets.paper(lam=6.0, k=0.1))
-# Alternative candidate:
-ctrl = SlidingModeGuidance(presets.boundary_layer_excess())
-# Memoryless candidates (absolute or RMS-relative threshold):
-ctrl = SlidingModeGuidance(presets.proximal_excess(k=0.1))
-ctrl = SlidingModeGuidance(presets.proximal_relative_excess(k=0.1))
-# Or plain CFG:
-ctrl = SlidingModeGuidance(presets.cfg_baseline())
-
-ctrl.reset()  # once per independent sampling trajectory
-v_hat = ctrl.guided_velocity(v_uncond, v_cond, w=7.5)
-~~~
-
-Errors have shape `[batch, ...]`, including one scalar per sample as `[batch]`.
-Controller state must be reset before changing batch shape, device, or working
-precision. Half-precision surfaces and RMS calculations use float32.
-The controller preserves the input error's identity gradient and output dtype;
-it is not a differentiable control-law training implementation.
-
-## Layout
-
-~~~text
-cfgctrl/controllers.py      guidance recurrence, variants, diagnostics
-cfgctrl/toy_flow.py         analytic Gaussian-mixture velocity and metrics
-cfgctrl/diffusers_hook.py   adapter for active doubled-batch CFG
-experiments/toy_smc_cfg.py  five CPU studies, CSV/JSON/figures
-experiments/real_model.py   GPU integration verification and image grid
-experiments/evaluate.py     paired CLIP scoring of a grid (alignment)
-experiments/fid.py          FID and KID per (arm, w) via clean-fid (fidelity)
-experiments/pareto.py       joins the two: fidelity at *matched* alignment
-tests/                     reference, numerical, experiment and adapter regressions
-docs/                      corrected review and improvement roadmap
-VLAB.md                    GPU setup and verification
-~~~
-
-Read the controller and its reference test first, then the review and toy plant.
-
-## Real-model verification
-
-The adapter's algebra is covered by dummy-denoiser tests. Its behavior with a
-trained checkpoint still needs verification on the target environment.
+Edit [configs/paper.json](configs/paper.json). It selects all three models and all three benchmarks, with GenAI-Bench restricted to SD3.5 to match the paper's supplementary comparison. Each arm gets the same prompts and seeds. For a smaller configuration:
 
 ~~~bash
-python experiments/real_model.py verify
-python experiments/real_model.py grid --w 1.5 2.0 3.0 4.5 7.0 --seeds 0 1 2
+python -m cfgctrl.benchmark init --models sd35 --benchmarks coco --config configs/sd35.json
 ~~~
 
-Which guidance laws run is a command-line argument, not a code edit:
-`--arms cfg paper` for the published law against its baseline,
-`--arms cfg "flux=paper:k=0.7" "excess:k=0.3"` to name and parameterize each
-arm. Add `--dry-run` to resolve the matrix without loading a model, and
-`--resume` to continue a job that hit a time limit. See [VLAB.md](VLAB.md).
+Set `evaluation.python` to the metrics environment's Python. Override `evaluation.scorers.mps.python` and `evaluation.scorers.compbench.python` for their environments. Paths in JSON are relative to the configuration file; absolute paths also work.
 
-## Scoring the images
-
-No single number ranks a guidance law. Weaker guidance buys fidelity and costs
-alignment, sliding along CFG's own tradeoff curve, so an arm with better FID at
-a fixed `w` may simply be guiding less. The question that can be answered is:
-**at the same alignment, does this arm reach a lower FID than CFG?**
-
-Three stages, or `./run_eval.sh results/coco_test` to chain them:
+Inspect the image count and check setup before starting an expensive run:
 
 ~~~bash
-python experiments/evaluate.py check --run results/coco_test --device cuda
-python experiments/evaluate.py clip  --run results/coco_test --device cuda
-python experiments/fid.py compute --run results/coco_test     --reference data/reference/val2017 --resume
-python experiments/pareto.py --run results/coco_test --fid results/coco_test/fid.csv
+python -m cfgctrl.benchmark plan --config configs/paper.json
+python -m cfgctrl.benchmark doctor --config configs/paper.json
+python -u -m cfgctrl.benchmark run --config configs/paper.json --out results/paper
 ~~~
 
-`check` comes first and is not optional: if prompts are matched to the wrong
-images, every later score is still a plausible number. `fid.py` caches the
-reference statistics once instead of per cell, and refuses to compare cells
-holding different numbers of images, because FID falls with sample size. It
-also writes KID, whose estimator is unbiased and which is the sounder column to
-rank on below a few thousand images per cell (`pareto.py --fid-column kid`).
+For multiple GPUs and an unattended run with hardware, generation, diagnostic and
+evaluation logs, follow [the nohup commands](docs/Running_Benchmarks.md). The generator
+accepts `--gpus 0 1` and coordinates one worker per GPU under a single output tree.
 
-`fid.py reference --run ...` builds the subset of COCO whose captions are that
-run's prompts. All of val2017 is the usual convention and is less noisy; the
-matched subset removes the content mismatch. Use one or the other throughout.
+`run` generates first, then evaluates and writes the report. The full default matrix is **121,200 images**. Remove models, benchmarks or arms from a separate configuration for an initial trial. `plan` loads no weights and creates no run directory; `doctor` checks assets and environments without testing model inference.
 
-Run `verify` before a grid. The grid requires active doubled-batch CFG and
-scales strictly greater than one. Pipelines commonly skip the unconditional
-branch at `w=1`; testing the paper law there requires a direct sampler that
-explicitly evaluates both predictions.
+The stages can also run separately:
 
-Flux-style separate forward passes are unsupported by this adapter.
-Do not interpret a no-op hook as an experimental comparison.
-See [VLAB.md](VLAB.md) for model loading, integration checks, and measurement.
+~~~bash
+python -u -m cfgctrl.benchmark generate --config configs/paper.json --out results/paper
+python -u -m cfgctrl.benchmark evaluate --out results/paper
+python -m cfgctrl.benchmark report --out results/paper
+python -m cfgctrl.benchmark diagnostics --out results/paper
+~~~
+
+Repeat a command to resume. Images and metric batches are saved as they finish. Changed image contents, prompts or generation settings are rejected. Use a fresh output directory for a different generation experiment. To change evaluator paths, checkpoints or metrics while retaining the same images:
+
+~~~bash
+python -u -m cfgctrl.benchmark evaluate --config configs/paper.json --out results/paper
+~~~
+
+Generation and evaluation accept `--models sd35` and `--benchmarks coco` to run part of the saved matrix. Evaluation/report additionally accept `--metrics fid clip`. A filtered report explicitly records its scope; it does not certify the rest of the matrix.
+
+`--gpus` belongs to `generate`; the full workflow wrapper runs parallel generation
+followed by evaluation on the first selected GPU. A model copy is loaded per worker.
+
+## Outputs and comparisons
+
+Each `model/benchmark/arm/w*/` directory contains PNG images, per-image records and raw metric results. The run root contains `plan.json`, evaluator logs, `summary.json` and `summary.csv`. Missing or stale results make reporting fail instead of silently reducing the sample count. `diagnostics.csv` reports late error, switching and the correction delivered to the scheduler.
+
+The default arms are `conditional` (one branch, `w=1`), `cfg`, `paper`, `excess`, `proximal` and `proximal_relative:k=0.1`. Named ablations such as `small=proximal:k=0.05` are supported. The relative gain is dimensionless; an equal numeric absolute gain is a different intervention. [The controller guide](docs/Chattering_Fixes.md) ranks improvements and explains the observed ±0.5 surface cycle. Better image quality remains an experimental question.
+
+The old `experiments/*.py` entry points, toy workflow and duplicate reviews have been retired. Existing results, images and weights were preserved; legacy outputs are not silently imported into the new experiment format. Pre-cleanup source backups are in `results/pre_pipeline_user_changes_20260907.zip` and `results/retired_pipeline_sources_20260907.zip`.
+
+## Tests
+
+~~~bash
+python -m pip install -r requirements.txt
+python -m pytest tests -q
+~~~
+
+The suite covers controller mathematics, all three model calling conventions using small test pipelines, identity checks, interrupted runs and metric aggregation. It does not download checkpoints or establish image quality.

@@ -1,0 +1,10 @@
+# Install matched torch/torchvision wheels before this file.
+diffusers==0.35.2
+transformers==4.51.3
+accelerate>=1.2,<2
+huggingface-hub>=0.34,<1
+sentencepiece
+protobuf>=3.20,<4
+pillow>=10
+numpy<2
+safetensors

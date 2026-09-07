@@ -1,32 +1,7 @@
-# conda env create -f environment.yml && conda activate clg
-#
-# Conda supplies the interpreter; pip supplies the packages.
-#
-# This portable spec does not select a CUDA build. For GPU work, use the
-# official PyTorch installation selector and verify the build as in VLAB.md.
-# An extra pip index has no priority over PyPI and would not pin CUDA 12.4.
+# Bootstrap only. Install the GPU wheel pair and requirements/generation.txt next.
 name: clg
-
 channels:
   - conda-forge
-
 dependencies:
   - python=3.11
   - pip
-  - pip:
-      - torch
-
-      # the toy experiments and the test suite
-      - matplotlib
-      - pytest
-
-      # only needed to drive a real model (SD3.5, Flux, ...)
-      - diffusers
-      - transformers
-      - accelerate
-      - sentencepiece
-      - protobuf
-
-      # only needed to score generated images (experiments/fid.py)
-      - clean-fid
-      - pillow

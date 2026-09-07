@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "models": {
+    "sd35": {
+      "scales": [
+        7.5
+      ],
+      "steps": 30,
+      "width": 1024,
+      "height": 1024,
+      "dtype": "bf16",
+      "offload": "model"
+    },
+    "flux": {
+      "scales": [
+        2.0
+      ],
+      "steps": 30,
+      "width": 1024,
+      "height": 1024,
+      "dtype": "bf16",
+      "offload": "model"
+    },
+    "qwen": {
+      "scales": [
+        4.0
+      ],
+      "steps": 30,
+      "width": 1024,
+      "height": 1024,
+      "dtype": "bf16",
+      "offload": "model"
+    }
+  },
+  "arms": [
+    "conditional",
+    "cfg",
+    "paper",
+    "excess",
+    "proximal",
+    "proximal_relative:k=0.1"
+  ],
+  "benchmarks": {
+    "coco": {
+      "manifest": "../data/benchmarks/coco.json",
+      "seeds": [
+        0
+      ],
+      "metrics": [
+        "fid",
+        "clip",
+        "aesthetic",
+        "imagereward",
+        "pickscore",
+        "hpsv2",
+        "hpsv21",
+        "mps"
+      ],
+      "reference": "../data/reference/val2017"
+    },
+    "compbench": {
+      "manifest": "../data/benchmarks/compbench.json",
+      "seeds": [
+        0
+      ],
+      "metrics": [
+        "compbench"
+      ]
+    },
+    "genai": {
+      "manifest": "../data/benchmarks/genai.json",
+      "seeds": [
+        0
+      ],
+      "metrics": [
+        "vqascore"
+      ],
+      "models": [
+        "sd35"
+      ]
+    }
+  },
+  "evaluation": {
+    "batch_size": 16,
+    "workers": 4,
+    "scorers": {
+      "aesthetic": {
+        "checkpoint": "../data/weights/sac+logos+ava1-l14-linearMSE.pth"
+      },
+      "mps": {
+        "repo": "../external/MPS",
+        "checkpoint": "../data/weights/MPS_overall_checkpoint.pth"
+      },
+      "compbench": {
+        "repo": "../external/T2I-CompBench"
+      }
+    }
+  }
+}

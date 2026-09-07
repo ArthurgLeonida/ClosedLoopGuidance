@@ -1,0 +1,9 @@
+# MPS source/checkpoint uses the authors' older Transformers API.
+# Install torch/torchvision in this separate Python 3.10 environment first.
+transformers==4.27.3
+huggingface-hub>=0.19,<1
+numpy<2
+pillow>=10
+sentencepiece
+einops>=0.6
+protobuf>=3.20,<4

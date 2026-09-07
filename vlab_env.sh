@@ -94,10 +94,9 @@ if [ ! -d "$CLG_ENV" ]; then
     conda create -y -p "$CLG_ENV" python=3.11 || return 1
     conda activate "$CLG_ENV" || return 1
     python -m pip install --upgrade pip || return 1
-    # torch first, from an index matching the driver. requirements.txt lists an
-    # unpinned torch, so the later install leaves this build in place.
-    python -m pip install torch --index-url "$CLG_TORCH_INDEX" || return 1
-    python -m pip install -r "$CLG_REPO/requirements.txt" || return 1
+    # Keep generation separate from the older evaluation dependencies.
+    python -m pip install torch torchvision --index-url "$CLG_TORCH_INDEX" || return 1
+    python -m pip install -r "$CLG_REPO/requirements/generation.txt" || return 1
     python -m pip freeze > "$CLG_ENV/requirements-resolved.txt"
     echo "recorded exact versions in $CLG_ENV/requirements-resolved.txt"
 else

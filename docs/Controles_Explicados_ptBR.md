@@ -7,10 +7,8 @@ repositório para o conceito clássico correspondente, usando a notação do art
 > Wang, Liu, Chi, Liu, Xue, Duan. CVPR 2026. arXiv:2603.03281
 
 Cada seção diz **o que é**, **como funciona**, **se o artigo usa** e **onde está
-no código**. Documentos relacionados: a [revisão da
-implementação](CFG-Ctrl_Review_and_Improvements.md), a [interpretação dos sinais
-medidos](Signal_Interpretation.md) e o [roteiro de
-melhorias](Improvement_Roadmap.md).
+no código**. Documentos relacionados: [diagnóstico e melhorias
+priorizadas](Chattering_Fixes.md) e [protocolo dos benchmarks](Benchmark_Protocol.md).
 
 ---
 
@@ -340,7 +338,12 @@ transferência entre modelos treinados.
 
 ## 8. O que os diagnósticos medem
 
-`experiments/signals.py` resume `signals.csv`. Cada coluna e sua leitura:
+A tabela histórica apresentada pelo usuário usa as colunas abaixo.
+No pipeline atual, `python -m cfgctrl.benchmark diagnostics --out results/paper`
+gera `diagnostics.csv`; os registros JSON por imagem guardam as séries completas.
+Os nomes resumidos são `e_last`, `s_last`, `delta_late`, `chatter_late`,
+`switch_late` e `velocity_correction_late`. As colunas `predicted`, `deriv` e `±`
+abaixo pertencem à tabela histórica, não ao novo CSV.
 
 | coluna | definição | cuidado na leitura |
 |---|---|---|
@@ -393,8 +396,11 @@ mudando de sinal entre passos.
 superfície nula na última avaliação, e a alternância do braço `paper` é
 compatível com o mecanismo de memória previsto. **O que não estabelece:** nada
 sobre qualidade de imagem. O artigo reporta ganhos de FID/CLIP e nada aqui os
-contradiz. Para qualidade, use `evaluate.py` (alinhamento pareado) e
-`pareto.py` (troca fidelidade × alinhamento na mesma altura de alinhamento).
+contradiz. Para qualidade, use `python -m cfgctrl.benchmark evaluate --out results/paper`
+e `python -m cfgctrl.benchmark report --out results/paper`, após a geração.
+Compare fidelidade em níveis semelhantes de alinhamento, usando uma varredura
+de escalas e os mesmos prompts/sementes. O novo relatório apresenta as métricas;
+não declara automaticamente um vencedor.
 
 ---
 

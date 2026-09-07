@@ -1,25 +1,10 @@
-"""Pure-logic tests for the CFG-Ctrl reimplementation. CPU only, a few seconds.
+"""Numerical and invariant tests for the core CFG-Ctrl guidance laws."""
 
-    python -m pytest tests/ -q
-
-The ones that carry the most weight, in order:
-  * test_k_zero_is_exact_cfg_for_every_variant  -- the baseline is a special
-    case of the method, so any measured difference is due to the correction
-  * test_reference_implementation_of_paper_law  -- we implement what the
-    authors' code does, not what we think Algorithm 1 says
-  * test_corrected_memory_alternates_once_the_error_is_small -- the chattering
-    mechanism, reproduced from first principles
-  * the toy-plant tests -- the analytic velocity field really does transport
-    N(0, I) to the mixture, otherwise every experiment number is noise
-"""
-
-from dataclasses import dataclass
 
 import pytest
 import torch
 
-from cfgctrl import SMCConfig, SlidingModeGuidance, presets, ring_mixture, soft_threshold
-from cfgctrl.diffusers_hook import GuidanceHook
+from cfgctrl import SMCConfig, SlidingModeGuidance, presets, soft_threshold
 
 torch.manual_seed(0)
 
@@ -181,108 +166,3 @@ def test_configuration_validation():
         SlidingModeGuidance(SMCConfig(k=-1.0))
     with pytest.raises(ValueError):
         SlidingModeGuidance(SMCConfig(switching="tanh"))
-
-
-# --------------------------------------------------------------------------
-# The toy plant must really be a flow-matching plant
-# --------------------------------------------------------------------------
-
-def test_single_gaussian_flow_transports_noise_to_target():
-    from cfgctrl import GaussianMixtureFlow
-    mu, sd = torch.tensor([[2.0, -1.0, 0.5]]), torch.tensor([0.7])
-    plant = GaussianMixtureFlow(mu, sd)
-    x, _ = plant.sample(n=6000, cond=0, w=1.0, steps=300, seed=3)
-    assert torch.allclose(x.mean(0), mu[0], atol=0.06)
-    assert torch.allclose(x.std(0), sd.expand(3), atol=0.04)
-
-
-def test_unguided_sampling_recovers_the_class_and_its_bayes_rate():
-    plant = ring_mixture(k=8, radius=4.0, std=1.5)
-    x, _ = plant.sample(n=6000, cond=0, w=1.0, steps=200, seed=0)
-    assert plant.frechet_distance(x, 0) < 0.15
-    truth = plant.true_class_samples(6000, 0, seed=5)
-    bayes = plant.class_accuracy(truth, 0)
-    assert 0.5 < bayes < 1.0            # classes overlap, so guidance has a job
-    assert abs(plant.class_accuracy(x, 0) - bayes) < 0.03
-
-
-def test_cfg_trades_fidelity_for_alignment():
-    """The whole reason a better guidance law could matter."""
-    plant = ring_mixture()
-    x1, _ = plant.sample(n=3000, cond=0, w=1.0, steps=30, seed=0)
-    x5, _ = plant.sample(n=3000, cond=0, w=5.0, steps=30, seed=0)
-    assert plant.class_confidence(x5, 0) > plant.class_confidence(x1, 0)
-    assert plant.frechet_distance(x5, 0) > plant.frechet_distance(x1, 0)
-
-
-def test_frechet_distance_of_true_samples_is_small():
-    plant = ring_mixture()
-    assert plant.frechet_distance(plant.true_class_samples(6000, 0), 0) < 0.1
-
-
-def test_error_jacobian_matches_autograd():
-    """E4 rests on this Jacobian, so check the finite differences against
-    autograd. The tolerance is set by float32 round-off in the central
-    difference (~eps_machine * |e| / h), not by the truncation error."""
-    plant = ring_mixture(k=4, dim=2)
-    x = torch.randn(3, 2) * 2
-    J_fd = plant.error_jacobian(x, 0.5, cond=0)
-    for b in range(3):
-        J_ad = torch.autograd.functional.jacobian(lambda z: plant.error(z[None], 0.5, 0)[0], x[b])
-        assert torch.allclose(J_fd[b], J_ad, atol=5e-3, rtol=1e-2)
-
-
-# --------------------------------------------------------------------------
-# The diffusers seam, against a dummy denoiser
-# --------------------------------------------------------------------------
-
-class _Dummy(torch.nn.Module):
-    def __init__(self, container="tensor"):
-        super().__init__()
-        self.container = container
-
-    def forward(self, x, timestep=None, **kw):
-        out = torch.tanh(x) * 2 + 0.1 * (x ** 2)
-        if self.container == "tensor":
-            return out
-        if self.container == "tuple":
-            return (out, "extra")
-
-        @dataclass
-        class Out:
-            sample: torch.Tensor
-        return Out(sample=out)
-
-
-@pytest.mark.parametrize("container", ["tensor", "tuple", "sample"])
-def test_hook_makes_the_pipeline_cfg_formula_equal_the_paper_law(container):
-    """The pipeline's own `uncond + w*(cond - uncond)` must come out equal to
-    Algorithm 1 line 13 once the hook has rewritten the conditional branch."""
-    torch.manual_seed(1)
-    w = 7.5
-    model = _Dummy(container)
-    lat = torch.randn(2, 4, 8, 8)
-    x = torch.cat([lat, lat])                        # [uncond, cond] doubled batch
-
-    raw = GuidanceHook._extract(model(x, timestep=torch.tensor([1000.0])))
-    unc_ref, cond_ref = raw.chunk(2)
-    expected = unc_ref + w * SlidingModeGuidance(presets.paper()).correct(cond_ref - unc_ref)
-
-    hook = GuidanceHook(model, SlidingModeGuidance(presets.paper())).attach()
-    try:
-        out = GuidanceHook._extract(model(x, timestep=torch.tensor([1000.0])))
-    finally:
-        hook.detach()
-    unc, cond = out.chunk(2)
-    assert torch.allclose(unc + w * (cond - unc), expected, atol=1e-6)
-    assert torch.equal(unc, unc_ref)                 # unconditional branch untouched
-
-
-def test_hook_is_transparent_when_k_is_zero_and_detaches_cleanly():
-    model = _Dummy()
-    x = torch.randn(4, 3)
-    ref = model(x, timestep=torch.tensor([500.0]))
-    hook = GuidanceHook(model, SlidingModeGuidance(presets.cfg_baseline())).attach()
-    assert torch.equal(model(x, timestep=torch.tensor([500.0])), ref)
-    hook.detach()
-    assert model.forward.__func__ is _Dummy.forward

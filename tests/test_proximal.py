@@ -1,13 +1,12 @@
 """Properties that motivate the memoryless correction, plus runner integration."""
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 
 import pytest
 import torch
 
 from cfgctrl import SMCConfig, SlidingModeGuidance, presets, soft_threshold
-from cfgctrl.diffusers_hook import GuidanceHook
-from experiments import real_model, signals, toy_smc_cfg
+from cfgctrl import arms
 
 
 @pytest.mark.parametrize("relative", [False, True])
@@ -101,47 +100,25 @@ def test_relative_threshold_is_per_sample_and_scales_with_error_sequence():
         torch.testing.assert_close(got, separate)
 
 
-def test_hook_applies_proximal_correction_after_arbitrary_history():
-    model = torch.nn.Identity()
-    ctrl = SlidingModeGuidance(presets.proximal_excess())
-    with GuidanceHook(model, ctrl, guidance_scale=3.0):
-        model(torch.tensor([[0.0, 0.0], [10.0, -10.0]]))
-        vu, vc = torch.tensor([[0.2, 0.1]]), torch.tensor([[0.21, -0.1]])
-        u, c = model(torch.cat([vu, vc])).chunk(2)
-        torch.testing.assert_close(u + 3 * (c-u), vc + 2 * soft_threshold(vc-vu, 0.1))
 
 
 @pytest.mark.parametrize("name,relative", [("proximal", False), ("proximal_relative", True)])
 def test_cli_resolves_new_arm_and_describes_its_actual_parameters(name, relative):
-    _, cfg = real_model.parse_arm(name + ":k=0.05", lam=6.0, k=0.1)
+    _, cfg = arms.parse_arm(name + ":k=0.05", lam=6.0, k=0.1)
     assert cfg.mode == "proximal" and cfg.excess_only and not cfg.store_corrected
     assert cfg.k == 0.05 and cfg.relative_gain == relative
-    description = real_model.describe_arm(name, cfg)
+    description = arms.describe_arm(name, cfg)
     assert "memoryless soft threshold" in description and "lam=" not in description
 
 
 @pytest.mark.parametrize("setting", ["lam=6", "phi=0.6", "switching=sat"])
 def test_unused_sliding_parameters_are_not_silently_tuned_on_proximal(setting):
     with pytest.raises(ValueError, match="does not use"):
-        real_model.parse_arm("proximal:" + setting, lam=6.0, k=0.1)
+        arms.parse_arm("proximal:" + setting, lam=6.0, k=0.1)
 
 
-def test_old_run_configs_can_resume_without_redefining_the_sliding_law():
-    config = dict(model="m", dtype="fp32", steps=30, prompts=["p"], w=[3.0], seeds=[0])
-    new_arm = asdict(presets.paper())
-    old_arm = {k: v for k, v in new_arm.items() if k != "mode"}
-    result = real_model.merge_config({**config, "arms": {"paper": old_arm}},
-                                    {**config, "arms": {"paper": new_arm}})
-    assert result["arms"]["paper"]["mode"] == "sliding"
-    with pytest.raises(ValueError, match="different settings"):
-        real_model.merge_config(result, {**config, "arms": {"paper": asdict(presets.proximal_excess())}})
 
 
-def test_proximal_is_part_of_toy_pareto_study_and_has_no_plateau_prediction():
-    configs = [cfg for _, cfg in toy_smc_cfg.method_table(0.1) if cfg.mode == "proximal"]
-    assert len(configs) == 2
-    assert {cfg.relative_gain for cfg in configs} == {False, True}
-    assert all(signals.predicted_plateau(asdict(cfg), w=3.0) is None for cfg in configs)
 
 
 def test_invalid_mode_and_corrected_memory_are_rejected():

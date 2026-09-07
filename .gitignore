@@ -10,7 +10,7 @@ logs/
 *.log
 *.out
 
-# Run outputs are not committed; regenerate with experiments/toy_smc_cfg.py.
+# Generated images, metric outputs and local source backups.
 results/
 *.pt
 *.ckpt
@@ -24,10 +24,13 @@ conda/
 git/
 
 # Reference image sets for FID are large and not ours to redistribute.
-# Prompt lists under data/prompts/ are small and should be committed: they
-# define the experiment. Nothing in this repository is trained, so there is no
-# training data to store here.
+# Prepared manifests are embedded in each saved run plan.
 data/reference/
+data/annotations/
+data/benchmarks/
+data/weights/
+external/
+.venv-*/
 
 # The paper PDF is not ours to redistribute; the write-up in docs/ is tracked.
 docs/*.pdf

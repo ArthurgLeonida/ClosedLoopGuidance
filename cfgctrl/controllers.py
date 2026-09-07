@@ -1,80 +1,17 @@
-"""Guidance as feedback control: CFG as P-control, and SMC-CFG.
+"""Guidance as feedback control: ordinary CFG and the CFG-Ctrl correction.
 
-Implements the guidance law of
+For e = v_cond - v_uncond, guided_velocity returns v_uncond + w * (e + delta).
+The paper law uses s = e + (lam - 1) * previous_corrected_error and
+delta = -k * sign(s). Its defaults are lam=6 and k=0.1 (FLUX uses k=0.7).
 
-    CFG-Ctrl: Control-Based Classifier-Free Diffusion Guidance
-    Wang, Liu, Chi, Liu, Xue, Duan. CVPR 2026. arXiv:2603.03281
+Optional refinements use measured memory, smooth saturation, excess-only
+correction, or a gain relative to per-sample RMS error. Proximal mode applies
+memoryless soft-thresholding to the current error and ignores the sliding
+parameters. At zero error it gives zero correction regardless of history.
 
-model-agnostically. Nothing here knows about images, UNets or transformers.
-The input is the semantic error tensor
-
-    e_t = v_theta(x_t, t, c) - v_theta(x_t, t, None)          (paper Eq. 6)
-
-and the output is the *applied* error e_t + delta_e_t, which the caller turns
-into a velocity exactly as the paper does (Algorithm 1, line 13):
-
-    v_hat = v_theta(x_t, t, None) + w * (e_t + delta_e_t)
-
-`k = 0` reproduces classifier-free guidance bit-exactly, so the baseline is a
-special case of the method and any measured difference is attributable to the
-correction.
-
-THE PAPER'S LAW (Algorithm 1; authors' pipeline/common_cfg_ctrl.py):
-
-    s_t      = (e_t - e_{t-1}) + lam * e_{t-1}      sliding variable (Eq. 19)
-    delta_e  = -k * sign(s_t)                       switching control (Eq. 25)
-    first step:  e_{t-1} := e_t   (so  s_0 = lam * e_0)
-    the CORRECTED error e_t + delta_e is stored as e_{t-1} for the next step
-
-Tuned values (supplementary Sec. 7.3): lam = 6 for all three models;
-k = 0.1 for SD3.5 and Qwen-Image, k = 0.7 for Flux-dev.
-
-REFINEMENTS TO TEST AGAINST THE PAPER. Each is one flag; the defaults reproduce
-the paper implementation. See docs/Improvement_Roadmap.md for the rationale,
-limitations, and a real-model evaluation plan. Toy findings do not establish
-an image-quality improvement.
-
-    mode            'sliding' (paper) or 'proximal': memoryless soft-thresholding
-                    of the current error. Proximal mode ignores lam, phi and
-                    switching, requires measured memory, and has s=e only as
-                    a diagnostic reference. It vanishes at e=0 regardless of
-                    history and cannot reverse or amplify an error component.
-
-    switching       'sign' (paper) or 'sat': a boundary layer of half-width
-                    phi (Slotine & Li, Applied Nonlinear Control, ch. 7).
-                    Smooths switching. With phi = k*lam and s = lam*e (the first
-                    step, or constant measured-error memory), the law is exact
-                    soft-thresholding of e by k. Historical toy: rms(s) reaches 0.010
-                    instead of plateauing at 0.50, and the switching activity
-                    is 0.03 of full chatter at every k against the sign law's
-                    0.39 (k=0.02) to 0.83 (k=1).
-
-    store_corrected keep the *applied* error as e_{t-1} (True, the authors'
-                    code) or the measured one (False, recommended). Storing
-                    the corrected error feeds the previous correction back into
-                    the surface with coefficient (lam - 1). Once e ~ 0 that
-                    makes s ~ (lam - 1) * delta_prev: for lam > 1 the sign
-                    alternates every step (chatter of amplitude k), for lam < 1
-                    it locks a constant bias of size k for the rest of the run.
-                    These are small-error limits, not guarantees for a changing
-                    model prediction.
-
-    excess_only     shrink only the extrapolation (w - 1) * e, never the
-                    conditional prediction itself:
-                        v_hat = v_cond + (w - 1) * (e + delta_e)
-                              = v_uncond + w * (e + (w-1)/w * delta_e).
-                    The paper's law modifies v_cond + (w-1) e as a whole, so at
-                    w = 1 it no longer samples the conditional law (measured:
-                    Frechet 0.162 vs 0.102 for CFG AND alignment 0.554 vs
-                    0.591 -- worse on both axes). With excess_only the law is
-                    exactly CFG at w = 1 for any k. Needs `w` passed to
-                    `correct`.
-
-    relative_gain   k is a fraction of rms(e_t) rather than an absolute
-                    velocity unit. With saturation, phi is also multiplied by
-                    rms(e_t); this makes the law equivariant to a constant positive
-                    rescaling of an error sequence. Cross-model transfer still
-                    needs experiments.
+These controller properties do not establish better image quality.
+See docs/Chattering_Fixes.md for the recurrence and ranked improvements, and
+docs/Benchmark_Protocol.md for the image evaluation protocol.
 """
 
 from __future__ import annotations

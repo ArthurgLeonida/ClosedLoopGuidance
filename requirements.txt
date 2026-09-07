@@ -1,23 +1,4 @@
-# cfgctrl/ itself needs only torch. The rest is for the experiments and for
-# driving a real diffusers pipeline through cfgctrl/diffusers_hook.py.
-torch
-matplotlib
-pytest
-
-# only needed to run against a real model (SD3.5, Flux, ...)
-diffusers
-transformers
-accelerate
-sentencepiece
-protobuf
-
-# only needed to score generated images (experiments/fid.py)
-# clean-fid rather than a local FID: the resize and the Inception weights move
-# the number by more than the effects being measured.
-# In a container with a preinstalled CUDA torch, install this one with
-#     python -m pip install --no-deps clean-fid
-# then add scipy/requests/tqdm: it lists torch and torchvision, and letting pip
-# resolve those can replace a working CUDA torch or install a torchvision built
-# against a different one. See VLAB.md section 5.
-clean-fid
-pillow
+# CPU controller and pipeline contract tests. Install your GPU torch separately.
+torch>=2.1
+pillow>=10
+pytest>=7
