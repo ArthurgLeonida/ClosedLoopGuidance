@@ -241,3 +241,22 @@ def test_plot_accepts_measured_memory_context(tmp_path):
     pytest.importorskip("matplotlib")
     run = controller_run(tmp_path, [[[0.1851], [0.0178], [0.0103]]])
     assert signals.plot(run, signals.summarise(run)).is_file()
+
+
+def test_proximal_report_does_not_claim_a_sliding_surface_or_derivative(tmp_path, capsys):
+    from dataclasses import asdict
+    from cfgctrl import presets
+
+    run = make_run(tmp_path, arms={"proximal_relative": asdict(presets.proximal_relative_excess())})
+    res = signals.summarise(run)
+    assert not res["measured_memory"]
+    signals.report(res, tail=5)
+    line = next(line for line in capsys.readouterr().out.splitlines()
+                if line.startswith("proximal_relative"))
+    assert "s=e" in line and line.endswith("--")
+    with signals.write_csv(run, res).open(newline="", encoding="utf-8") as fh:
+        row = next(csv.DictReader(fh))
+    assert row["surface_reference"] == "current_error"
+    assert row["predicted_plateau"] == row["ratio"] == row["deriv_matters"] == ""
+    assert row["s_rms_lower_bound"] == row["s_rms_upper_bound"] == ""
+    assert row["switch_activity_applied_norm"] == ""  # adaptive threshold has no fixed gain

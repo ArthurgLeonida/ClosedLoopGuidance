@@ -26,3 +26,7 @@ dependencies:
       - accelerate
       - sentencepiece
       - protobuf
+
+      # only needed to score generated images (experiments/fid.py)
+      - clean-fid
+      - pillow

@@ -14,6 +14,7 @@ What it reports, per (arm, scale):
                   approximately (lam-1)*k in the small-error alternating regime.
                   An arm storing the MEASURED error instead has
                   s_n = e_n + (lam-1)*e_(n-1); both measurements matter.
+                  Proximal mode instead logs s=e, without a sliding surface.
                   This is the last denoiser call, before its scheduler update,
                   not a measurement at the final decoded image.
   chatter         fraction of latent elements whose sign(s) flipped since the
@@ -94,11 +95,12 @@ def applied_gain(arm_cfg: Dict, w: Optional[float] = None) -> Optional[float]:
 def predicted_plateau(arm_cfg: Dict, w: Optional[float] = None) -> Optional[float]:
     """Small-error alternating surface amplitude, not a fixed point or proof.
 
-    It comes from feeding the previous correction back into the surface, so it
+    Feeding the previous correction back into the surface can sustain a cycle.
     This approximation requires corrected memory, sign switching, a fixed
     positive gain and lam > 1. Smooth/relative laws need separate analysis.
     """
-    if (not arm_cfg.get("store_corrected", True)
+    if (arm_cfg.get("mode", "sliding") != "sliding"
+            or not arm_cfg.get("store_corrected", True)
             or arm_cfg.get("switching", "sign") != "sign"):
         return None
     lam, k = float(arm_cfg.get("lam", 0.0)), applied_gain(arm_cfg, w)
@@ -168,7 +170,8 @@ def summarise(run: Path, tail: int = 5):
                                    ("e_prev", "s", "lower", "upper")})
     for (arm, w, _, _), values in endpoints.items():
         cfgs = arms.get(arm, {})
-        if cfgs.get("store_corrected", True) or not all(s in values for s in (steps - 2, steps - 1)):
+        if (cfgs.get("mode", "sliding") != "sliding" or cfgs.get("store_corrected", True)
+                or not all(s in values for s in (steps - 2, steps - 1))):
             continue
         prev = values[steps - 2][0]
         current, surface = values[steps - 1]
@@ -185,8 +188,9 @@ def summarise(run: Path, tail: int = 5):
 
 def report(res: Dict, tail: int) -> None:
     arms, keys = res["arms"], sorted(res["final_s"])
+    arm_width = max([10] + [len(arm) + 1 for arm, _ in keys])
     print(f"{res['rows']} rows, {res['steps']} steps\n")
-    print(f"{'arm':<10}{'w':>6}{'rms(e)':>17}{'rms(s) last':>16}{'predicted':>11}"
+    print(f"{'arm':<{arm_width}}{'w':>6}{'rms(e)':>17}{'rms(s) last':>16}{'predicted':>11}"
           f"{'ratio':>8}{'chatter':>9}{'switch':>9}{'deriv':>8}")
     for key in keys:
         arm, w = key
@@ -196,13 +200,15 @@ def report(res: Dict, tail: int) -> None:
         f = res["final_s"][key]
         e0, e1 = res["e_first"][key].mean, res["e_final"][key].mean
         norm = f"{res['switch'][key].mean / (2 * gain):.3f}" if gain else "--"
-        pred_txt = (f"{pred:.3f}" if pred else
+        pred_txt = ("s=e" if cfgs.get("mode") == "proximal" else f"{pred:.3f}" if pred else
                     "tracks e" if not cfgs.get("store_corrected", True) else "n/a")
+        deriv_txt = ("--" if cfgs.get("mode") == "proximal" else
+                     f"{res['deriv'][key].mean * 100:.1f}%")
         ratio = f"{f.mean / pred:.2f}" if pred else "--"
-        print(f"{arm:<10}{w:>6.2f}{e0:>8.4f}->{e1:<8.4f}"
+        print(f"{arm:<{arm_width}}{w:>6.2f}{e0:>8.4f}->{e1:<8.4f}"
               f"{f.mean:>9.4f} ±{f.sd:.3f}{pred_txt:>11}{ratio:>8}"
               f"{res['late_chat'][key].mean:>9.3f}{norm:>9}"
-              f"{res['deriv'][key].mean * 100:>7.1f}%")
+              f"{deriv_txt:>8}")
 
     print("\n  'last' is the last denoiser evaluation, before its scheduler update.")
     print("  'predicted' is a small-error alternating amplitude for corrected-memory")
@@ -215,6 +221,8 @@ def report(res: Dict, tail: int) -> None:
     print("  Averages need not obey that equality. Relative-gain normalisation is omitted.")
     print("  'deriv' counts strict sign disagreement with stored memory over the whole")
     print("  run; low values do not imply agreement with the current measured error.")
+    print("  Proximal arms use s=e for logging, with no sliding surface or derivative;")
+    print("  their surface norms are not comparable to the sliding arms' norms.")
     print(f"  These are controller diagnostics only: they say nothing about image")
     print(f"  quality. Use evaluate.py and pareto.py for that.")
     if res["measured_memory"]:
@@ -236,7 +244,7 @@ def write_csv(run: Path, res: Dict) -> Path:
                       "s_rms_final_sd", "predicted_plateau", "ratio", "chatter_late",
                       "switch_activity_norm", "deriv_matters", "switch_activity_applied_norm",
                       "n_paired", "e_rms_prev_final", "s_rms_paired_final",
-                      "s_rms_lower_bound", "s_rms_upper_bound"])
+                      "s_rms_lower_bound", "s_rms_upper_bound", "surface_reference"])
         for key in sorted(res["final_s"]):
             arm, w = key
             cfgs = res["arms"].get(arm, {})
@@ -251,11 +259,12 @@ def write_csv(run: Path, res: Dict) -> Path:
                           "" if pred is None else f"{f.mean / pred:.6f}",
                           f"{res['late_chat'][key].mean:.6f}",
                           f"{res['switch'][key].mean / (2 * k):.6f}" if k else "",
-                          f"{res['deriv'][key].mean:.6f}",
+                          f"{res['deriv'][key].mean:.6f}" if cfgs.get("mode") != "proximal" else "",
                           f"{res['switch'][key].mean / (2 * gain):.6f}" if gain else "",
                           b["s"].n if b else 0,
                           *([f"{b[name].mean:.6f}" for name in ("e_prev", "s", "lower", "upper")]
-                            if b else [""] * 4)])
+                            if b else [""] * 4),
+                          "current_error" if cfgs.get("mode") == "proximal" else "sliding_surface"])
     return out
 
 
@@ -287,12 +296,14 @@ def plot(run: Path, res: Dict) -> Optional[Path]:
             if pred:
                 axes[0][col].axhline(pred, color=colors[i % len(colors)], linestyle="--",
                                     linewidth=0.9, label=f"limit w={w:g}: {pred:.2f}")
-            elif not res["arms"].get(arm, {}).get("store_corrected", True):
+            elif (res["arms"].get(arm, {}).get("mode", "sliding") == "sliding"
+                  and not res["arms"].get(arm, {}).get("store_corrected", True)):
                 lam = float(res["arms"][arm].get("lam", 0.0))
                 axes[0][col].plot(steps, [lam * res["per_step"][(arm, w, s)]["e_rms"].mean
                                         for s in steps], color=colors[i % len(colors)],
                                  linestyle=":", linewidth=1.0, label=f"lam*rms(e), w={w:g} (approx.)")
-        axes[0][col].set_title(f"{arm}: sliding variable", loc="left", fontsize=10)
+        reference = "current error (s=e)" if res["arms"].get(arm, {}).get("mode") == "proximal" else "sliding variable"
+        axes[0][col].set_title(f"{arm}: {reference}", loc="left", fontsize=10)
         axes[1][col].set_title(f"{arm}: chatter", loc="left", fontsize=10)
         for row in (0, 1):
             axes[row][col].set_xlabel("denoising step")

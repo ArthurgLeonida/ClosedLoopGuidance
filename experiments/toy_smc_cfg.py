@@ -49,15 +49,15 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from cfgctrl import GaussianMixtureFlow, SMCConfig, SlidingModeGuidance, ring_mixture  # noqa: E402
+from cfgctrl import GaussianMixtureFlow, SMCConfig, SlidingModeGuidance, ring_mixture, presets  # noqa: E402
 
 LAM = 6.0
 SCHEMA_VERSION = 2
 
 # Fixed colour slot per method, kept across every figure. Markers are the
 # secondary encoding so the figures survive greyscale printing.
-COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#4a3aa7", "#e34948"]
-MARKERS = ["o", "s", "^", "D", "X", "v"]
+COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#4a3aa7", "#e34948", "#007f88", "#754c24"]
+MARKERS = ["o", "s", "^", "D", "X", "v", "P", "*"]
 TEXT, TEXT2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
 
 
@@ -70,6 +70,8 @@ def method_table(k: float, lam: float = LAM) -> List[Tuple[str, SMCConfig]]:
         ("SMC + boundary layer (sat)", SMCConfig(lam=lam, k=k, **sat)),
         ("paper (sign), extrapolation only", SMCConfig(lam=lam, k=k, excess_only=True)),
         ("boundary layer, extrapolation only", SMCConfig(lam=lam, k=k, excess_only=True, **sat)),
+        ("proximal, extrapolation only", presets.proximal_excess(k)),
+        ("proximal relative, extrapolation only", presets.proximal_relative_excess(k)),
     ]
 
 
@@ -260,15 +262,20 @@ def exp_signals(out: Path, plant: GaussianMixtureFlow, w: float, k: float, steps
     mt = method_table(k)
     methods = [
         (mt[1][0], mt[1][1], 1),
-        ("paper law, measured-error memory", SMCConfig(lam=LAM, k=k, store_corrected=False), 5),
+        ("paper law, measured-error memory", SMCConfig(lam=LAM, k=k, store_corrected=False), 7),
         (mt[2][0], mt[2][1], 2),
+        (mt[4][0], mt[4][1], 4),
+        (mt[5][0], mt[5][1], 5),
+        (mt[6][0], mt[6][1], 6),
     ]
-    keys = ("e_rms", "s_rms", "chatter", "switch_activity", "deriv_matters")
+    keys = ("e_rms", "s_rms", "chatter", "switch_activity", "deriv_matters", "delta_rms")
     fig, axes = plt.subplots(1, len(keys), figsize=(3.8 * len(keys), 3.6))
     rows = []
     for name, cfg, idx in methods:
         r, _, trace = run_one(plant, w, cfg, steps, n, 0)
         for key, ax in zip(keys, axes):
+            if key == "deriv_matters" and cfg.mode == "proximal":
+                continue  # No temporal derivative exists in this mode.
             ax.plot(trace.sigmas, trace.series(key), color=COLORS[idx], marker=MARKERS[idx],
                     markersize=3.5, linewidth=1.6, label=name,
                     markeredgecolor=SURFACE, markeredgewidth=0.6)
@@ -276,18 +283,21 @@ def exp_signals(out: Path, plant: GaussianMixtureFlow, w: float, k: float, steps
             rows.append(dict(method=name, step=t, sigma=trace.sigmas[t],
                              **{kk: getattr(st, kk) for kk in keys}))
         summary.setdefault("e2", {})[name] = {
+            "surface_reference": "current error (s=e)" if cfg.mode == "proximal" else "sliding surface",
             "s_rms_first": trace.steps[0].s_rms, "s_rms_final": trace.steps[-1].s_rms,
             "chatter_last10": statistics.mean(trace.series("chatter")[-10:]),
             "switch_activity_last10": statistics.mean(trace.series("switch_activity")[-10:]),
+            "delta_rms_last10": statistics.mean(trace.series("delta_rms")[-10:]),
             "deriv_matters_mean": r["deriv_matters_mean"],
             "frechet": r["frechet"], "confidence": r["confidence"],
         }
     write_csv(out / "e2_signals.csv", rows)
     style(axes[0], f"Measured error |e| (w={w}, k={k})", "sigma (1 = noise, 0 = data)", "rms(e)")
-    style(axes[1], "Sliding variable |s|: does it reach 0?", "sigma", "rms(s)")
+    style(axes[1], "Reference |s| (proximal uses s=e)", "sigma", "rms(s): definitions differ by mode")
     style(axes[2], "Chatter index: sign(s) flips per element", "sigma", "fraction flipped")
     style(axes[3], "Switching activity rms(delta_t - delta_t-1)", "sigma", "rms (2k = full chatter)")
-    style(axes[4], "Derivative-matters index: sign(s) != sign(e_prev)", "sigma", "fraction")
+    style(axes[4], "Derivative index (sliding modes only)", "sigma", "fraction")
+    style(axes[5], "Applied error correction", "sigma", "rms(delta)")
     for ax in axes:
         ax.invert_xaxis()
     axes[1].legend(fontsize=6.5, frameon=False, labelcolor=TEXT2)
@@ -487,6 +497,7 @@ def main() -> None:
     seeds = [0, 1] if args.quick else [0, 1, 2]
     ws = [1.0, 1.25, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0]
     summary: Dict = {"config": dict(n=n, seeds=seeds, ws=ws, k=args.k,
+                                    methods=[name for name, _ in method_table(args.k)],
                                     steps=args.steps, lam=LAM, threads=args.threads,
                                     torch_version=torch.__version__, python_version=sys.version,
                                     metric="Gaussian moment W2 (square root of FID expression)",

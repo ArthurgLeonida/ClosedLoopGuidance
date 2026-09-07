@@ -201,3 +201,10 @@ That is a separate algorithm requiring a justified control response, retuning
 and evaluation. Lowering $\lambda$ merely to reduce the displayed surface
 would not establish better control or better images. See the
 [improvement roadmap](Improvement_Roadmap.md) for the broader research plan.
+
+The follow-up [ranked chattering fixes](Chattering_Fixes.md) implement a simpler
+alternative: memoryless soft-thresholding of the current CFG extrapolation,
+with absolute or RMS-relative thresholds. Its logged `s=e` is a current-error
+reference, so its surface norm must not be compared directly with either
+sliding arm's norm. The follow-up includes fresh toy evidence and the limits
+of claiming an image-quality improvement.

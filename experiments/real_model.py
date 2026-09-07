@@ -87,6 +87,8 @@ PRESETS = {
     "paper": presets.paper,
     "boundary_layer": presets.boundary_layer,
     "excess": presets.boundary_layer_excess,
+    "proximal": presets.proximal_excess,
+    "proximal_relative": presets.proximal_relative_excess,
 }
 _ALIASES = {"cfg_baseline": "cfg", "bl": "boundary_layer", "sat": "boundary_layer",
             "boundary_layer_excess": "excess"}
@@ -107,12 +109,16 @@ def _coerce(field: str, raw: str):
         if raw not in ("sign", "sat"):
             raise ValueError(f"switching={raw!r} must be 'sign' or 'sat'")
         return raw
+    if field == "mode":
+        if raw not in ("sliding", "proximal"):
+            raise ValueError(f"mode={raw!r} must be 'sliding' or 'proximal'")
+        return raw
     if field in _BOOL_FIELDS:
         value = _BOOLS.get(raw.lower())
         if value is None:
             raise ValueError(f"{field}={raw!r} must be true or false")
         return value
-    known = ", ".join(_FLOAT_FIELDS + ("switching",) + _BOOL_FIELDS)
+    known = ", ".join(_FLOAT_FIELDS + ("switching", "mode") + _BOOL_FIELDS)
     raise ValueError(f"unknown controller field {field!r}; known fields: {known}")
 
 
@@ -147,7 +153,13 @@ def parse_arm(spec: str, lam: float, k: float) -> Tuple[str, SMCConfig]:
     # lay every explicit override on top.
     lam_eff = float(overrides.get("lam", lam))
     k_eff = float(overrides.get("k", k))
-    cfg = PRESETS[preset]() if preset == "cfg" else PRESETS[preset](lam_eff, k_eff)
+    if preset in ("proximal", "proximal_relative"):
+        unused = {"lam", "phi", "switching"} & overrides.keys()
+        if unused:
+            raise ValueError(f"proximal correction does not use {', '.join(sorted(unused))}")
+        cfg = PRESETS[preset](k=k_eff)
+    else:
+        cfg = PRESETS[preset]() if preset == "cfg" else PRESETS[preset](lam_eff, k_eff)
     cfg = replace(cfg, **overrides)
     cfg.validate()
     return name, cfg
@@ -189,7 +201,10 @@ def merge_config(old: Dict, new: Dict) -> Dict:
                 "images already there would not be comparable. Use a fresh --out."
             )
     for name, cfg in new["arms"].items():
-        if name in old.get("arms", {}) and old["arms"][name] != cfg:
+        # Older results predate the mode field and used sliding correction.
+        old_cfg = {"mode": "sliding", **old.get("arms", {}).get(name, {})}
+        new_cfg = {"mode": "sliding", **cfg}
+        if name in old.get("arms", {}) and old_cfg != new_cfg:
             raise ValueError(
                 f"--resume into a directory where arm {name!r} had different "
                 "settings; give the new one another name, or use a fresh --out."
@@ -205,10 +220,11 @@ def merge_config(old: Dict, new: Dict) -> Dict:
 def describe_arm(name: str, cfg: SMCConfig) -> str:
     if cfg.is_cfg:
         return f"{name:<12} plain CFG (k = 0, the baseline every other arm is measured against)"
-    bits = [f"lam={cfg.lam:g}", f"k={cfg.k:g}", f"switching={cfg.switching}"]
-    if cfg.switching == "sat":
+    bits = (["memoryless soft threshold", f"k={cfg.k:g}"] if cfg.mode == "proximal" else
+            [f"lam={cfg.lam:g}", f"k={cfg.k:g}", f"switching={cfg.switching}"])
+    if cfg.mode == "sliding" and cfg.switching == "sat":
         bits.append(f"phi={cfg.phi:g}")
-    if not cfg.store_corrected:
+    if cfg.mode == "sliding" and not cfg.store_corrected:
         bits.append("measured-error memory")
     if cfg.excess_only:
         bits.append("extrapolation only")
@@ -422,19 +438,21 @@ def cmd_verify(args) -> int:
         print(f"      steps seen        {len(h)}  (requested {steps})")
         print(f"      latent shape      {caps[0][2] if caps else 'n/a'}  dtype {caps[0][3] if caps else 'n/a'}")
         print(f"      rms(e)            {h[0].e_rms:.4f} -> {h[-1].e_rms:.4f}")
-        print(f"      rms(s)            {h[0].s_rms:.4f} -> {h[-1].s_rms:.4f}")
+        surface = "rms(s=e)" if ctrl.cfg.mode == "proximal" else "rms(s)"
+        print(f"      {surface:<18}{h[0].s_rms:.4f} -> {h[-1].s_rms:.4f}")
         tail = h[-5:]
         print(f"      chatter (last {len(tail)})  {sum(x.chatter for x in tail) / len(tail):.3f}")
-        print(f"      deriv decides     {sum(x.deriv_matters for x in h) / len(h) * 100:.1f} %")
+        derivative = ("n/a (memoryless)" if ctrl.cfg.mode == "proximal" else
+                      f"{sum(x.deriv_matters for x in h) / len(h) * 100:.1f} %")
+        print(f"      deriv decides     {derivative}")
         if len(h) != steps:
             print(f"      WARN  {len(h)} controller calls for {steps} requested steps")
         if any(not math.isfinite(value) for st in h for value in vars(st).values()):
             failures.append("controller diagnostics contain nonfinite values")
             print("      FAIL  nonfinite controller diagnostics")
-        print("\n      Compare against the toy plant (docs section 3): a mean "
-              "derivative-decides\n      index near 1-2 % and a late chatter near 1.0 would "
-              "reproduce the finding\n      that the paper's law is a sign-shrink that "
-              "chatters.")
+        print("\n      Inspect correction magnitude and switching alongside image quality."
+              "\n      Proximal mode reports s=e; its norm is not the paper's sliding surface."
+              "\n      See docs/Chattering_Fixes.md for the mechanism and comparison plan.")
 
     print("\n" + "=" * 70)
     if failures:
@@ -556,7 +574,7 @@ def main() -> int:
                     help="guidance laws to run, as [name=]preset[:field=value,...]. "
                          f"Presets: {', '.join(sorted(PRESETS))} (aliases: "
                          f"{', '.join(sorted(_ALIASES))}). Fields: "
-                         f"{', '.join(_FLOAT_FIELDS + ('switching',) + _BOOL_FIELDS)}. "
+                         f"{', '.join(_FLOAT_FIELDS + ('switching', 'mode') + _BOOL_FIELDS)}. "
                          "Examples: 'paper' for the published law alone; 'paper:k=0.7' "
                          "for Flux's gain; 'flux=paper:k=0.7' to name its output "
                          f"directory. Default: {' '.join(DEFAULT_ARMS)}")

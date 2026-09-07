@@ -575,3 +575,50 @@ together along one curve, so a law that only lowers the effective scale will
 show a "better" number on whichever of the two axes you look at alone. Follow
 the [improvement roadmap](docs/Improvement_Roadmap.md) for the comparison
 protocol.
+
+## 5. Score the images
+
+Alignment and fidelity are measured separately and only mean something jointly.
+`run_eval.sh` chains the whole thing, sourcing `vlab_env.sh` the same way
+`run_grid.sh` does:
+
+~~~bash
+./run_eval.sh results/coco_test
+~~~
+
+That runs, in order: `evaluate.py check`, `evaluate.py clip`, `fid.py compute`,
+`pareto.py` on FID and on KID, and `signals.py`. `check` aborts the rest if it
+fails, because a wrong prompt/image pairing still yields plausible numbers.
+
+FID needs the real images, which the prompt files do not carry:
+
+~~~bash
+curl -L -o "$CLG_PERSIST/val2017.zip" http://images.cocodataset.org/zips/val2017.zip
+unzip -q "$CLG_PERSIST/val2017.zip" -d data/reference/
+~~~
+
+Override the reference with `CLG_REF`, and the device with `CLG_DEVICE`:
+
+~~~bash
+CLG_REF=data/reference/matched CLG_DEVICE=cuda:3 ./run_eval.sh results/coco_test
+~~~
+
+The reference Inception statistics are computed once and cached inside the
+`clean-fid` package directory. Because `vlab_env.sh` puts the environment at
+`$CLG_PERSIST/envs/clg`, that cache survives a container relaunch along with
+everything else. It is keyed by `--stats-name`, *not* by the reference path, so
+change the name whenever you change `--reference` or the stale statistics are
+silently reused.
+
+Two guards worth knowing about before they stop a job:
+
+* `fid.py compute` refuses cells holding different numbers of images. FID falls
+  as sample size grows, so a cell that lost images to a killed job would score
+  better for a reason unrelated to guidance. Finish the grid with
+  `real_model.py grid --resume`, or pass `--allow-unequal` knowingly.
+* At ~1,000 images per cell the FID bias term dominates the absolute value.
+  That bias is common to every cell, so differences stay usable, but read
+  `pareto.py --fid-column kid` as well: KID's estimator is unbiased.
+
+`--resume` is safe and cheap: `fid.csv` is rewritten after every cell, so a job
+killed at cell 12 of 15 keeps the first eleven.

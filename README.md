@@ -14,9 +14,19 @@ Start with [possible improvements and why they could help](docs/Improvement_Road
 The [implementation review](docs/CFG-Ctrl_Review_and_Improvements.md) explains
 the controller, the toy evidence, and limits of the control-theory interpretation.
 
+Em português: [os controles usados no artigo e neste repositório](docs/Controles_Explicados_ptBR.md)
+maps every control concept to the paper's notation and says which ones are the
+paper's and which are this repository's options.
+
 For real-run diagnostics, read [why the last surface is not zero](docs/Signal_Interpretation.md).
 `python experiments/signals.py --run results/coco_test` now reports the previous
 measured error and the corresponding surface-norm bounds, using existing CSV rows.
+
+The [ranked chattering fixes](docs/Chattering_Fixes.md) explain the new
+`proximal` and `proximal_relative` arms and their fresh toy results. Both
+soft-threshold the current CFG extrapolation without temporal control memory.
+They produce zero correction at zero error and cannot reverse a guidance
+component; better image quality still needs a trained-model comparison.
 
 ## The controller
 
@@ -88,6 +98,9 @@ from cfgctrl import SlidingModeGuidance, presets
 ctrl = SlidingModeGuidance(presets.paper(lam=6.0, k=0.1))
 # Alternative candidate:
 ctrl = SlidingModeGuidance(presets.boundary_layer_excess())
+# Memoryless candidates (absolute or RMS-relative threshold):
+ctrl = SlidingModeGuidance(presets.proximal_excess(k=0.1))
+ctrl = SlidingModeGuidance(presets.proximal_relative_excess(k=0.1))
 # Or plain CFG:
 ctrl = SlidingModeGuidance(presets.cfg_baseline())
 
@@ -109,7 +122,9 @@ cfgctrl/toy_flow.py         analytic Gaussian-mixture velocity and metrics
 cfgctrl/diffusers_hook.py   adapter for active doubled-batch CFG
 experiments/toy_smc_cfg.py  five CPU studies, CSV/JSON/figures
 experiments/real_model.py   GPU integration verification and image grid
-experiments/evaluate.py     paired CLIP scoring of a grid; FID is delegated
+experiments/evaluate.py     paired CLIP scoring of a grid (alignment)
+experiments/fid.py          FID and KID per (arm, w) via clean-fid (fidelity)
+experiments/pareto.py       joins the two: fidelity at *matched* alignment
 tests/                     reference, numerical, experiment and adapter regressions
 docs/                      corrected review and improvement roadmap
 VLAB.md                    GPU setup and verification
@@ -132,6 +147,33 @@ Which guidance laws run is a command-line argument, not a code edit:
 `--arms cfg "flux=paper:k=0.7" "excess:k=0.3"` to name and parameterize each
 arm. Add `--dry-run` to resolve the matrix without loading a model, and
 `--resume` to continue a job that hit a time limit. See [VLAB.md](VLAB.md).
+
+## Scoring the images
+
+No single number ranks a guidance law. Weaker guidance buys fidelity and costs
+alignment, sliding along CFG's own tradeoff curve, so an arm with better FID at
+a fixed `w` may simply be guiding less. The question that can be answered is:
+**at the same alignment, does this arm reach a lower FID than CFG?**
+
+Three stages, or `./run_eval.sh results/coco_test` to chain them:
+
+~~~bash
+python experiments/evaluate.py check --run results/coco_test --device cuda
+python experiments/evaluate.py clip  --run results/coco_test --device cuda
+python experiments/fid.py compute --run results/coco_test     --reference data/reference/val2017 --resume
+python experiments/pareto.py --run results/coco_test --fid results/coco_test/fid.csv
+~~~
+
+`check` comes first and is not optional: if prompts are matched to the wrong
+images, every later score is still a plausible number. `fid.py` caches the
+reference statistics once instead of per cell, and refuses to compare cells
+holding different numbers of images, because FID falls with sample size. It
+also writes KID, whose estimator is unbiased and which is the sounder column to
+rank on below a few thousand images per cell (`pareto.py --fid-column kid`).
+
+`fid.py reference --run ...` builds the subset of COCO whose captions are that
+run's prompts. All of val2017 is the usual convention and is less noisy; the
+matched subset removes the content mismatch. Use one or the other throughout.
 
 Run `verify` before a grid. The grid requires active doubled-batch CFG and
 scales strictly greater than one. Pipelines commonly skip the unconditional

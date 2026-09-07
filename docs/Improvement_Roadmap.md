@@ -1,6 +1,6 @@
 # Improving CFG-Ctrl: proposals, rationale, and evidence needed
 
-The most promising next experiment is **smooth guidance correction with measured-error memory, applied only to CFG extrapolation**. It has clearer endpoint behavior and avoids a specific source of oscillation in the published discrete recurrence. Those are mathematical and implementation advantages; **better images than the original paper remain a hypothesis**. This repository has CPU experiments on an analytic Gaussian mixture, not a reproduced SD3.5, Flux, or Qwen benchmark.
+The first implementation priority is now **memoryless soft-thresholding of CFG extrapolation**, followed by an RMS-relative threshold. Both are available as experiment arms. The [ranked chattering review](Chattering_Fixes.md) explains the mechanism, guarantees, limitations, and fresh CPU comparison. The existing smooth correction with measured-error memory remains a useful comparator. **Better images than the original paper remain a hypothesis**; the new toy results do not establish a consistent winner.
 
 This roadmap accompanies the [detailed review](CFG-Ctrl_Review_and_Improvements.md). It distinguishes existing options from proposed research and explains what would support or falsify each proposal. Sources were checked on 2026-09-04 against the [local paper, arXiv v2](CFG-Ctrl.pdf), the [online paper](https://arxiv.org/html/2603.03281v2), and the [authors' implementation](https://github.com/THU-SI/CFG-Ctrl/blob/main/pipeline/common_cfg_ctrl.py).
 
@@ -24,7 +24,7 @@ These options live in [controllers.py](../cfgctrl/controllers.py). Their compati
 
 | Priority and option | Why it could improve on the published recurrence | What it does not guarantee |
 |---|---|---|
-| 1. `store_corrected=False` | Removes the previous correction from the next surface calculation. With small measured error and $\lambda>1$, corrected memory can sustain alternating corrections of magnitude $k$. **Measured on SD3.5-large** (30 steps, $w=7$, one prompt/seed): $\mathrm{rms}(s)$ 0.5168 to 0.1139 and chatter 0.991 to 0.267, with the measured error unchanged to 1.1 %. | Measured errors can still oscillate, and useful temporal behavior might be lost. Residual chatter of 0.267 is the model's own sign changes. Lower chatter is not an image-quality result. |
+| 1. `store_corrected=False` | Removes the previous correction from the next surface calculation. With small measured error and $\lambda>1$, corrected memory can sustain alternating corrections of magnitude $k$. **Measured on SD3.5-large** (30 steps, $w=7$, one prompt/seed): $\mathrm{rms}(s)$ 0.5168 to 0.1139 and chatter 0.991 to 0.267, with the measured error unchanged to 1.1 %. | Measured errors can still oscillate, and useful temporal behavior might be lost. Residual chatter counts sign changes in the surface containing two measurements; it does not directly measure the current model error's sign changes. Lower chatter is not an image-quality result. |
 | 2. `switching="sat"` | Replaces the discontinuous sign switch with $\operatorname{clip}(s/\phi,-1,1)$, reducing abrupt changes near zero. | Smooth correction does not prove convergence or better image quality. |
 | 3. `excess_only=True` | Preserves the ordinary conditional prediction at $w=1$ and attenuates only additional guidance. | It changes the correction strength at every $w>1$; retuning is necessary. |
 | 4. `relative_gain=True` | Expresses correction size relative to each sample's measured velocity discrepancy. Scaling both gain and saturation width avoids dependence on arbitrary velocity units. | Matching units does not remove differences in model geometry, prompt difficulty, or error reliability. |
@@ -65,11 +65,11 @@ Handle $r_n=0$ with zero correction. If an entire error sequence is multiplied b
 
 All four changes require no extra denoiser evaluations. They still require tensor operations and diagnostics can cause CPU/GPU synchronization, so benchmark actual latency.
 
-## 3. Future experiments, in order
+## 3. Follow-up experiments
 
-### A. Add a memoryless soft-threshold baseline
+### A. Compare the memoryless soft-threshold baseline
 
-**Status:** `soft_threshold()` exists as a helper; a dedicated controller and experiment arm remain to be added.
+**Status:** implemented as `presets.proximal_excess()` and `presets.proximal_relative_excess()`, exposed by the CLI as `proximal` and `proximal_relative`. Both participate in toy E1/E2. See [the implementation and measured comparison](Chattering_Fixes.md).
 
 Use
 

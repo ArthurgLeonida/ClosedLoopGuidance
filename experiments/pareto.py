@@ -59,17 +59,23 @@ def read_alignment(path: Path) -> Dict[Tuple[str, float], float]:
     return out
 
 
-def read_fidelity(path: Path) -> Dict[Tuple[str, float], float]:
-    """(arm, w) -> FID. Any CSV with arm, w and fid columns."""
+def read_fidelity(path: Path, column: str = "fid") -> Dict[Tuple[str, float], float]:
+    """(arm, w) -> fidelity. Any CSV with arm, w and the named column.
+
+    `column` exists so the same join can be read on KID, which experiments/fid.py
+    writes alongside FID. At a thousand images per cell KID is the sounder of the
+    two: its estimator is unbiased, while FID at that size is dominated by a
+    sample-size bias term.
+    """
     out: Dict[Tuple[str, float], float] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        missing = {"arm", "w", "fid"} - set(reader.fieldnames or [])
+        missing = {"arm", "w", column} - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"{path} is missing column(s): {sorted(missing)}")
         for row in reader:
             try:
-                value = float(row["fid"])
+                value = float(row[column])
             except (TypeError, ValueError):
                 continue
             if math.isfinite(value):
@@ -133,24 +139,30 @@ def main() -> int:
     ap.add_argument("--baseline", default="cfg")
     ap.add_argument("--clip-summary", type=Path, default=None,
                     help="default: <run>/clip_summary.csv")
+    ap.add_argument("--fid-column", default="fid",
+                    help="which fidelity column to join on; 'kid' is the sounder "
+                         "choice when each cell holds only ~1000 images")
     args = ap.parse_args()
 
     clip_path = args.clip_summary or (args.run / "clip_summary.csv")
     try:
-        rows = build(read_alignment(clip_path), read_fidelity(args.fid), args.baseline)
+        rows = build(read_alignment(clip_path),
+                     read_fidelity(args.fid, args.fid_column), args.baseline)
     except ValueError as exc:
         ap.error(str(exc))
 
-    print(f"{'arm':<10}{'w':>6}{'alignment':>12}{'FID':>10}"
+    label = args.fid_column.upper()
+    print(f"{'arm':<10}{'w':>6}{'alignment':>12}{label:>10}"
           f"{'CFG at same':>13}{'ratio':>8}")
     for r in rows:
         ref = f"{r['cfg_fid_at_same_alignment']:.3f}" if r["cfg_fid_at_same_alignment"] else "--"
-        ratio = f"{r['ratio']:.3f}" if r["ratio"] else ("baseline" if r["arm"] == args.baseline else "--")
+        ratio = f"{r['ratio']:.3f}" if r["ratio"] else ("base" if r["arm"] == args.baseline else "--")
         mark = "  *" if (r["ratio"] and r["ratio"] < 1) else ""
         print(f"{r['arm']:<10}{r['w']:>6.2f}{r['alignment']:>12.4f}{r['fid']:>10.3f}"
               f"{ref:>13}{ratio:>8}{mark}")
 
-    out = args.run / "pareto.csv"
+    out = args.run / ("pareto.csv" if args.fid_column == "fid"
+                      else f"pareto_{args.fid_column}.csv")
     with open(out, "w", newline="", encoding="utf-8") as fh:
         wri = csv.DictWriter(fh, fieldnames=list(rows[0]))
         wri.writeheader()
