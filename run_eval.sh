@@ -60,14 +60,30 @@ step() {                      # step "name" cmd...
     return "${PIPESTATUS[0]}"
 }
 
-step "check" python -u experiments/evaluate.py check --run "$OUT" --device "$DEV" || {
-    echo "check FAILED: the prompt/image pairing is wrong, so every score below" >&2
-    echo "would be meaningless. Nothing else was run." >&2
+# Exit 3 from evaluate.py means it could not start -- a broken install, no
+# checkpoint, a device that is not there. That is a different finding from a
+# failed check, and reporting it as one sends you inspecting the images while
+# the problem is the environment.
+step "check" python -u experiments/evaluate.py check --run "$OUT" --device "$DEV"
+status=$?
+if [ "$status" -eq 3 ]; then
+    echo "check could not RUN: this environment cannot score images (reason above)." >&2
+    echo "No image was read, so this says nothing about $OUT. Nothing else ran." >&2
+    exit 3
+elif [ "$status" -ne 0 ]; then
+    echo "check FAILED: the images or their prompt pairing are wrong, so every" >&2
+    echo "score below would be meaningless. Nothing else was run." >&2
     exit 1
-}
+fi
 
-step "clip" python -u experiments/evaluate.py clip --run "$OUT" --device "$DEV" "$@" \
-    || echo "WARNING: CLIP scoring failed; the Pareto join needs it" >&2
+step "clip" python -u experiments/evaluate.py clip --run "$OUT" --device "$DEV" "$@"
+status=$?
+if [ "$status" -eq 3 ]; then
+    echo "WARNING: CLIP could not run (environment, see above). Fidelity is still" >&2
+    echo "         measured, but without alignment there is no Pareto join." >&2
+elif [ "$status" -ne 0 ]; then
+    echo "WARNING: CLIP scoring failed; the Pareto join needs it" >&2
+fi
 
 if [ -d "$REF" ]; then
     step "fid" python -u experiments/fid.py compute --run "$OUT" --reference "$REF" \

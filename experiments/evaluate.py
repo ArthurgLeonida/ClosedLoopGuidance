@@ -39,6 +39,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 CLIP_SCALE = 2.5      # Hessel et al. 2021: CLIPScore = 2.5 * max(cos, 0)
 Key = Tuple[str, float, int, int]        # (arm, w, prompt_id, seed)
+EXIT_SETUP = 3        # the environment cannot score at all; see SetupError
+
+
+class SetupError(RuntimeError):
+    """Scoring could not start.
+
+    Kept distinct from a failed `check`, which means the images or their
+    pairing are wrong. Conflating the two sends you looking at the data when
+    the problem is the installation, so this exits with its own code.
+    """
+
+
+def root_cause(exc: BaseException) -> BaseException:
+    """The innermost exception in a `raise ... from ...` chain.
+
+    transformers imports CLIP lazily and re-raises a generic
+    `ModuleNotFoundError: Could not import module 'CLIPModel'`, which names the
+    symbol that failed rather than the reason. The reason is the chained cause.
+    """
+    seen = {id(exc)}
+    while True:
+        nxt = exc.__cause__ or exc.__context__
+        if nxt is None or id(nxt) in seen:
+            return exc
+        seen.add(id(nxt))
+        exc = nxt
 
 
 # --------------------------------------------------------------------- layout
@@ -72,10 +98,43 @@ def image_index(run: Path, cfg: dict) -> Tuple[Dict[Key, Path], List[Key]]:
 
 # --------------------------------------------------------------------- CLIP
 def load_clip(model_name: str, device: str):
-    from transformers import CLIPModel, CLIPProcessor
+    try:
+        from transformers import CLIPModel, CLIPProcessor
+    except Exception as exc:
+        cause = root_cause(exc)
+        raise SetupError(f"""transformers could not provide CLIPModel.
+  raised:     {type(exc).__name__}: {exc}
+  real cause: {type(cause).__name__}: {cause}
 
-    model = CLIPModel.from_pretrained(model_name).to(device).eval()
-    return model, CLIPProcessor.from_pretrained(model_name)
+This is an environment problem. No image was read, so it says nothing at all
+about the run being scored.
+
+Transformers imports CLIP lazily, so its own message names the symbol that
+failed rather than the reason. Surface the reason directly:
+
+    python -c 'import transformers.models.clip.modeling_clip'
+    python -c 'import torchvision; print(torchvision.__version__)'
+
+The usual cause is torchvision: absent, or built against a different torch than
+the one installed. That is common in NGC-style containers, where torch is
+preinstalled and pip later pulls a torchvision compiled for another torch,
+which then fails on an undefined symbol. Install a torchvision matching your
+torch, from the index torch itself came from, and check the two commands above
+before rerunning.""") from exc
+
+    try:
+        model = CLIPModel.from_pretrained(model_name).to(device).eval()
+        processor = CLIPProcessor.from_pretrained(model_name)
+    except Exception as exc:
+        cause = root_cause(exc)
+        raise SetupError(f"""could not load the CLIP checkpoint {model_name!r}.
+  raised:     {type(exc).__name__}: {exc}
+  real cause: {type(cause).__name__}: {cause}
+
+This is an environment problem, not a result. Check that HF_HOME points at the
+persistent cache (source vlab_env.sh), that this node can reach the hub or the
+checkpoint is already cached, and that device {device!r} exists here.""") from exc
+    return model, processor
 
 
 def embed(model, inputs) -> Tuple["object", "object"]:
@@ -346,6 +405,10 @@ def main() -> int:
         return cmd_check(args) if args.mode == "check" else cmd_clip(args)
     except ValueError as exc:
         ap.error(str(exc))
+    except SetupError as exc:
+        print("", file=sys.stderr)
+        print(f"SETUP ERROR: {exc}", file=sys.stderr)
+        return EXIT_SETUP
     except RuntimeError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         return 1

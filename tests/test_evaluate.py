@@ -230,3 +230,57 @@ def test_prompts_needed_matches_the_pilot_arithmetic():
     assert math.isclose(evaluate.prompts_needed(deltas, 0.00325),
                         (1.96 * sd / 0.00325) ** 2, rel_tol=1e-9)
     assert 150 < evaluate.prompts_needed(deltas, 0.00325) < 250
+
+
+# ------------------------------------------- a broken install is not a result
+
+def test_root_cause_walks_to_the_innermost_exception():
+    try:
+        try:
+            raise ImportError("undefined symbol: _ZN3c10")
+        except ImportError as inner:
+            raise ModuleNotFoundError("Could not import module 'CLIPModel'") from inner
+    except ModuleNotFoundError as outer:
+        assert str(evaluate.root_cause(outer)) == "undefined symbol: _ZN3c10"
+
+
+def test_a_lazy_transformers_failure_names_the_real_cause(monkeypatch):
+    """transformers re-raises as `Could not import module 'CLIPModel'`, which
+    names the symbol rather than the reason. The reason is the chained cause,
+    and it is what the operator needs to see."""
+    import sys
+    from types import ModuleType
+
+    fake = ModuleType("transformers")
+
+    def _getattr(name):
+        try:
+            raise ImportError("undefined symbol: _ZN3c105ErrorC1E")
+        except ImportError as inner:
+            raise ModuleNotFoundError(
+                f"Could not import module '{name}'. Are this object's "
+                "requirements defined correctly?") from inner
+
+    fake.__getattr__ = _getattr
+    monkeypatch.setitem(sys.modules, "transformers", fake)
+
+    with pytest.raises(evaluate.SetupError) as caught:
+        evaluate.load_clip("openai/clip-vit-base-patch32", "cpu")
+    text = str(caught.value)
+    assert "undefined symbol: _ZN3c105ErrorC1E" in text     # the real reason
+    assert "torchvision" in text                            # where to look
+    assert "says nothing at all" in text                    # not a data finding
+
+
+def test_a_setup_failure_exits_with_its_own_code(monkeypatch, capsys):
+    """Exit 3, not 1: run_eval.sh reports 1 as a failed check, which would send
+    the reader inspecting images that were never opened."""
+    import sys
+
+    def boom(_args):
+        raise evaluate.SetupError("transformers could not provide CLIPModel")
+
+    monkeypatch.setattr(evaluate, "cmd_check", boom)
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "check", "--run", "unused"])
+    assert evaluate.main() == evaluate.EXIT_SETUP == 3
+    assert "SETUP ERROR" in capsys.readouterr().err

@@ -590,6 +590,29 @@ That runs, in order: `evaluate.py check`, `evaluate.py clip`, `fid.py compute`,
 `pareto.py` on FID and on KID, and `signals.py`. `check` aborts the rest if it
 fails, because a wrong prompt/image pairing still yields plausible numbers.
 
+### Install clean-fid without letting pip touch torch
+
+`clean-fid` lists `torch` and `torchvision` as dependencies. In a container
+whose torch is preinstalled and CUDA-matched, a plain `pip install clean-fid`
+can resolve a *different* torch or a torchvision built against one, leaving an
+environment where `import torchvision` fails on an undefined symbol. Everything
+that imports through torchvision then breaks, including `CLIPModel`, which
+surfaces as `ModuleNotFoundError: Could not import module 'CLIPModel'`.
+
+Install it without dependency resolution, then add only what is missing:
+
+~~~bash
+python -m pip install --no-deps clean-fid
+python -m pip install scipy requests tqdm            # clean-fid's light deps
+python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__)"
+python -c "import torch; print(torch.cuda.is_available())"
+python -c "import transformers.models.clip.modeling_clip; print('clip ok')"
+~~~
+
+If torchvision is absent or mismatched, install the build that matches the
+installed torch, from the index torch itself came from -- never a bare
+`pip install torchvision`, which can drag torch along with it.
+
 FID needs the real images, which the prompt files do not carry:
 
 ~~~bash
