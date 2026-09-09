@@ -55,15 +55,9 @@ Why it might help: weak unwanted guidance coordinates are attenuated without ove
 
 ## Evaluate the improvement
 
-The default [paper configuration](../configs/paper.json) includes CFG, paper, excess and both proximal arms, plus the conditional baseline. Prepare data and evaluator environments using [README.md](../README.md), then:
+Start with the [small research profiles](Research_Workflow.md) while changing the controller. They retain paired images and full controller traces while reducing the default development run to 256 images. Reserve the full [paper configuration](../configs/paper.json) for later benchmark evaluation.
 
-~~~bash
-python -m cfgctrl.benchmark plan --config configs/paper.json
-python -u -m cfgctrl.benchmark run --config configs/paper.json --out results/paper
-python -m cfgctrl.benchmark diagnostics --out results/paper
-~~~
-
-Use named gains such as `small=proximal:k=0.05` and `relative02=proximal_relative:k=0.2` for ablations. Tune absolute and relative gains separately on held-out prompts; compare against retuned paper gains and CFG scales.
+Use named gains such as `small=proximal:k=0.05` and `relative02=proximal_relative:k=0.2` for ablations. Tune absolute and relative gains separately on development prompts; compare against retuned paper gains and CFG scales, then validate on held-out prompts.
 
 `diagnostics.csv` reports the final measured error and surface RMS, late switching, correction magnitude and the actual velocity perturbation after dtype conversion. Proximal's `surface_reference=current_error` means `s=e` is a diagnostic reference, not a sliding surface. The per-image JSON keeps the complete traces.
 

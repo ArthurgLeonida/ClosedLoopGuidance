@@ -2,6 +2,8 @@
 
 Compare the published controller with ordinary CFG and the implemented chattering fixes on SD3.5-Large, FLUX.1-dev and Qwen-Image. One configuration selects the models, controller arms, scales, benchmarks and seeds.
 
+**Developing a new method? Start with the [research workflow](docs/Research_Workflow.md): 32-image smoke tests, 256-image development runs, and separate validation prompts.** The full matrix below is for later benchmark evaluation.
+
 | Benchmark | Evaluation |
 |---|---|
 | COCO, 5,000 frozen image-caption pairs | FID, CLIP, Aesthetic, ImageReward, PickScore, HPSv2, HPSv2.1, MPS |
