@@ -35,3 +35,5 @@ external/
 
 # The paper PDF is not ours to redistribute; the write-up in docs/ is tracked.
 docs/*.pdf
+docs/research_summary/
+QuantizationAndPruning_Paper/
